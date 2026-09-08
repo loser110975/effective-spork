@@ -72,17 +72,7 @@ export default class DouyinSyncPlugin extends Plugin {
     this.addCommand({
       id: "test-connection",
       name: "测试连接",
-      callback: async () => {
-        const { DouyinClient } = await import("./douyinClient");
-        try {
-          const via = this.settings.bridgeEnabled ? this.settings.bridgeUrl : undefined;
-          const msg = await new DouyinClient(this.settings.cookie, via, () => this.spawnBridge()).testConnection();
-          this.showResult(`${via ? "（经本地桥接）" : ""}${msg}`);
-        } catch (e: any) {
-          const via = this.settings.bridgeEnabled ? "（经本地桥接）" : "（直连，未走桥接）";
-          this.showResult(`连接失败${via}：${e?.message ?? e}`, true);
-        }
-      },
+      callback: () => void this.testDouyinConnection(),
     });
     this.addCommand({
       id: "generate-bases",
@@ -127,6 +117,26 @@ export default class DouyinSyncPlugin extends Plugin {
 
   async loadEngineState() {
     await this.engine.loadState(this._stateRaw);
+  }
+
+  /**
+   * 按当前请求通道测试抖音连接。
+   *
+   * 设置页按钮与命令面板必须共用本入口，避免其中一处漏传桥接配置后
+   * 回退到 Obsidian requestUrl 直连，并被抖音 Argus 风控误判为非浏览器请求。
+   */
+  async testDouyinConnection(): Promise<void> {
+    const { DouyinClient } = await import("./douyinClient"); // 仅在用户测试时加载请求客户端。
+    const bridgeUrl = this.settings.bridgeEnabled ? this.settings.bridgeUrl : undefined; // 开关关闭时明确选择直连。
+    const channelLabel = bridgeUrl ? "（经本地桥接）" : "（直连，未走桥接）"; // 反馈中显示真实通道，便于定位风控。
+
+    try {
+      const client = new DouyinClient(this.settings.cookie, bridgeUrl, () => this.spawnBridge()); // 桥未启动时由插件拉起。
+      const message = await client.testConnection(); // 只读取少量收藏，验证登录态和 API 响应。
+      this.showResult(`${channelLabel}${message}`); // 成功提示也携带通道，避免把桥接成功误认成直连成功。
+    } catch (error: any) {
+      this.showResult(`连接失败${channelLabel}：${error?.message ?? error}`, true);
+    }
   }
 
   restartInterval() {

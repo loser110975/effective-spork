@@ -33,18 +33,9 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
       );
     new Setting(containerEl)
       .setName("测试连接")
-      .setDesc("用当前 Cookie 调一次收藏接口，验证登录态与接口可用性")
+      .setDesc("按当前请求通道调一次收藏接口，验证登录态、桥接与接口可用性")
       .addButton((b) =>
-        b.setButtonText("测试").onClick(async () => {
-          const { DouyinClient } = await import("./douyinClient");
-          const client = new DouyinClient(s.cookie);
-          try {
-            const msg = await client.testConnection();
-            this.plugin.showResult(msg);
-          } catch (e: any) {
-            this.plugin.showResult(`连接失败：${e?.message ?? e}`, true);
-          }
-        }),
+        b.setButtonText("测试").onClick(() => void this.plugin.testDouyinConnection()),
       );
 
     new Setting(containerEl).setName("同步范围").setHeading();

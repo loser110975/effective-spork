@@ -1,6 +1,6 @@
 {
   "name": "douyin-sync-obsidian",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Obsidian plugin: sync Douyin favorites/likes/posts to vault with cloud ASR transcripts",
   "main": "main.js",
   "scripts": {
