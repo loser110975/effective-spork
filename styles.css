@@ -1,0 +1,15 @@
+/* 抖音同步归档 - minimal styles */
+
+.douyin-sync-status {
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.douyin-sync-progress {
+  margin: 0.5em 0;
+}
+
+.douyin-sync-callout-hint {
+  font-size: 0.85em;
+  color: var(--text-faint);
+}

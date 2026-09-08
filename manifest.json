@@ -1,0 +1,9 @@
+{
+  "id": "douyin-sync",
+  "name": "抖音同步归档",
+  "version": "1.0.0",
+  "minAppVersion": "1.9.0",
+  "description": "自动同步抖音收藏/点赞/作品到 Vault：云端 ASR 逐字稿（不下载不上传）、图文识别、AI 分类、Bases 画廊",
+  "author": "A-Zhou",
+  "isDesktopOnly": true
+}

@@ -1,0 +1,21 @@
+{
+  "name": "douyin-sync-obsidian",
+  "version": "1.0.0",
+  "description": "Obsidian plugin: sync Douyin favorites/likes/posts to vault with cloud ASR transcripts",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "typecheck": "tsc -noEmit -skipLibCheck"
+  },
+  "keywords": [],
+  "author": "A-Zhou",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.24.0",
+    "obsidian": "^1.8.7",
+    "typescript": "^5.6.0"
+  }
+}
