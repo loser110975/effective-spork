@@ -45,7 +45,9 @@ views:
     sort:
       - property: file.mtime
         direction: DESC
-    groupBy: note.category
+    groupBy:
+      property: note.category
+      direction: ASC
     image: note.cover
     imageFit: cover
     cardSize: 160
@@ -71,6 +73,10 @@ views:
     limit: 100
   - type: cards
     name: 爆款封面
+    order:
+      - file.name
+      - note.author
+      - note.likes
     sort:
       - property: note.likes
         direction: DESC
@@ -90,7 +96,10 @@ views:
     name: 最近同步
     filters:
       and:
-        - file.mtime >= now() - 7d
+        - file.mtime >= now() - "7d"
+    order:
+      - file.name
+      - note.category
     sort:
       - property: file.mtime
         direction: DESC
@@ -101,7 +110,7 @@ views:
     name: 最近同步（列表）
     filters:
       and:
-        - file.mtime >= now() - 7d
+        - file.mtime >= now() - "7d"
     order:
       - file.name
       - note.author

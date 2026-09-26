@@ -1,4 +1,13 @@
 node_modules/
-bridge.log
 *.log
 
+# 备份文件
+*.bak
+*.bak-*
+
+# 临时测试文件
+.tmp*
+
+# 系统文件
+Thumbs.db
+.DS_Store

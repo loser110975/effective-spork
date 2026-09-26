@@ -13,3 +13,80 @@
   font-size: 0.85em;
   color: var(--text-faint);
 }
+
+/* ---------- 四项新功能：管理面板 / 二维状态灯 / 异常内联块 ---------- */
+
+.douyin-sync-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: var(--background-secondary);
+}
+
+.douyin-sync-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0 10px;
+  flex-wrap: wrap;
+}
+
+.douyin-sync-dot {
+  font-size: 1.05em;
+  line-height: 1;
+}
+
+.douyin-sync-status-text {
+  font-weight: 600;
+}
+
+.douyin-sync-status-advice {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  flex-basis: 100%;
+}
+
+.douyin-sync-ops {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.douyin-sync-detail {
+  margin-top: 10px;
+  font-size: 0.85em;
+}
+
+.douyin-sync-row {
+  display: flex;
+  gap: 8px;
+  line-height: 1.6;
+}
+
+.douyin-sync-k {
+  color: var(--text-muted);
+  min-width: 5.5em;
+}
+
+.douyin-sync-v {
+  word-break: break-all;
+}
+
+.douyin-sync-inline {
+  color: var(--text-error, #e05252);
+  font-size: 0.85em;
+  min-height: 1em;
+  margin-bottom: 10px;
+  white-space: pre-wrap;
+}
+
+/* 设置页内的实时状态行 */
+.douyin-sync-status-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 0.85em;
+  flex-wrap: wrap;
+}

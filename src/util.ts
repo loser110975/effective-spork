@@ -2,6 +2,37 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// ---------- Node 模块统一访问（问题 3：替代分散的 (window as any).require） ----------
+
+/**
+ * Electron 渲染进程的 Node require 统一入口：带错误边界与类型收敛。
+ * 不可用（非桌面端 / nodeIntegration 关闭）时返回 null，调用方据此走降级分支。
+ */
+export function nodeRequireFn(): ((id: string) => any) | null {
+  try {
+    const req = (window as any).require;
+    return typeof req === "function" ? req : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 按模块 id require；不可用时返回 null。 */
+export function nodeRequire<T = any>(id: string): T | null {
+  const req = nodeRequireFn();
+  try {
+    return req ? (req(id) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 同步存在性检查；fs 不可用时返回 false（调用方应有候选回退或 stderr 兜底）。 */
+export function fsExists(p: string): boolean {
+  const fs = nodeRequire<{ existsSync(p: string): boolean }>("fs");
+  return !!fs && fs.existsSync(p);
+}
+
 const ILLEGAL = /[\\/:*?"<>|#^[\]%\u0000-\u001f]/g;
 
 export function sanitizeFilename(name: string, maxLen = 60): string {
@@ -68,17 +99,7 @@ export function parseList(text: string): string[] {
     .filter(Boolean);
 }
 
-export function clampInt(v: number, lo: number, hi: number): number {
-  if (!Number.isFinite(v)) return lo;
-  return Math.max(lo, Math.min(hi, Math.round(v)));
-}
-
 /** 去水印播放地址：playwm → play */
 export function noWatermark(url: string): string {
   return url ? url.replace("playwm", "play") : url;
-}
-
-export function truncate(s: string, n: number): string {
-  if (!s) return "";
-  return s.length > n ? s.slice(0, n) + "…" : s;
 }

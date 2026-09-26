@@ -1,17 +1,16 @@
-import { SyncItem } from "./types";
-import { SOURCE_LABEL } from "./types";
-import { AsrResult } from "./types";
+import { SyncItem, SOURCE_LABEL, AsrResult } from "./types";
 import { isoFromUnix, localDate, mmss, yamlStr, fmtDuration } from "./util";
 
 export interface NoteContentInput {
   item: SyncItem;
-  folder: string; // 收藏夹名 / "" 
+  folder: string; // 收藏夹名 / ""
   category: string;
   coverPath: string; // vault 相对路径，空=未下载
-  imagePathPrefix: string; // Media 下本条目的图片目录
   imagesDownloaded: string[]; // 已下载的 vault 相对路径
   visionTexts: { index: number; text: string; status: string }[];
   asr: AsrResult | null;
+  framePaths: string[]; // 视频关键帧（vault 相对路径，时间顺序）；图文类为空
+  keyframeIntervalSec: number; // 本次抽帧使用的间隔设置（写入 frontmatter frame_interval，供补跑判断）
   syncedAt: string;
 }
 
@@ -40,7 +39,7 @@ function callout(lines: string[], type = "quote", title = "逐字稿", fold = tr
 }
 
 export function buildNote(input: NoteContentInput): string {
-  const { item, folder, category, coverPath, imagesDownloaded, visionTexts, asr, syncedAt } = input;
+  const { item, folder, category, coverPath, imagesDownloaded, visionTexts, asr, framePaths, keyframeIntervalSec, syncedAt } = input;
   const typeLabel = item.type === "note" ? "图文" : "视频";
   const sourceLabel = SOURCE_LABEL[item.source];
   const shareUrl =
@@ -75,6 +74,9 @@ export function buildNote(input: NoteContentInput): string {
     fm.push(`transcript_status: ${yamlStr(asr.status)}`);
   } else {
     fm.push(`transcript_status: ${item.type === "video" ? "not_requested" : "not_applicable"}`);
+  }
+  if (item.type === "video" && keyframeIntervalSec > 0) {
+    fm.push(`frame_interval: ${keyframeIntervalSec}`);
   }
   fm.push(`tags:`, `  - 抖音`, `  - ${sourceLabel}`, "---", "");
 
@@ -124,12 +126,23 @@ export function buildNote(input: NoteContentInput): string {
         }
       }
       fm.push(callout(lines, "quote", `逐字稿（${asr.provider ?? "ASR"}）`, true), "");
+    } else if (asr && asr.status === "unavailable") {
+      // 结构上无内容可转（无视频轨的音频类条目 / 无对白）：信息块，不提示重试（重试无意义）
+      fm.push(
+        callout([`未转写：${asr.error ?? "无可转写内容"}`, `该项在抖音侧没有可供转写的语音内容。`], "info", "逐字稿", true),
+        "",
+      );
     } else if (asr && asr.status !== "success") {
       fm.push(callout([`转写未成功：${asr.error ?? asr.status}`, `可在设置中配置 ASR 后用命令「重试失败转写」重试。`], "warning", "逐字稿", true), "");
     } else {
       fm.push(callout(["未启用转写：在插件设置中选择 ASR 服务商并填入 Key。", "说明：以下为视频文案（非逐字稿）。"], "info", "逐字稿", true), "");
       if (item.desc) fm.push(item.desc, "");
     }
+  }
+
+  // 关键帧（视频笔记）：抽帧成功时嵌入全部帧图，折叠避免干扰阅读；摘要未生成时帧也不丢失
+  if (item.type === "video" && framePaths.length > 0) {
+    fm.push(callout(framePaths.map((p) => `![[${p}]]`), "note", `关键帧（${framePaths.length} 张）`, true), "");
   }
 
   fm.push("---", "");

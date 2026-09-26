@@ -1,6 +1,7 @@
 import { requestUrl, RequestUrlParam, RequestUrlResponse } from "obsidian";
 import { DouyinAwemeRaw, DouyinPage, SyncItem, ItemType } from "./types";
 import { noWatermark } from "./util";
+import { classifyItemType } from "./itemType";
 
 /**
  * 抖音 Web API 客户端。
@@ -40,9 +41,16 @@ export interface CollectionFolder {
   name: string;
 }
 
+/**
+ * 生效的请求头档位记忆（问题 7）：跨实例保留。
+ * 每次重建 DouyinClient 都从 0 开始重试会重复「全套头→最小集」的降级链路，
+ * 模块级记忆让后续实例直接从上一次成功的档位发起。
+ */
+let rememberedVariant = 0;
+
 export class DouyinClient {
   /** 生效的请求头档位：0=全套（含 sec-ch-ua/sec-fetch） 1=无指纹头 2=最小集（UA+Cookie）。 */
-  private variant = 0;
+  private variant = rememberedVariant;
 
   constructor(
     private cookie: string,
@@ -145,6 +153,7 @@ export class DouyinClient {
       try {
         const res = await requestUrl({ ...opts, headers: variants[i], throw: false } as RequestUrlParam);
         this.variant = i;
+        rememberedVariant = i; // 问题 7：跨实例记忆生效档位
         return res;
       } catch (e) {
         lastErr = e;
@@ -324,7 +333,14 @@ export class DouyinClient {
       if (best) images.push(best);
       if (images.length >= 10) break;
     }
-    const type: ItemType = images.length > 0 ? "note" : "video";
+    // 类型明确区分：is_note / aweme_type 显式信号优先，「有图即图文」作回退
+    const awemeType = typeof raw.aweme_type === "number" ? raw.aweme_type : undefined;
+    const mediaType = typeof raw.media_type === "number" ? raw.media_type : undefined;
+    const type: ItemType = classifyItemType({
+      hasImages: images.length > 0,
+      isNote: raw.is_note === true,
+      awemeType,
+    });
     const cover =
       raw.video?.cover?.url_list?.[0] ||
       raw.video?.origin_cover?.url_list?.[0] ||
@@ -343,6 +359,8 @@ export class DouyinClient {
       coverUrl: cover,
       imageUrls: images,
       durationSec: Math.round(Number(raw.video?.duration ?? 0) / 1000),
+      awemeType,
+      mediaType,
       stats: {
         likes: Number(raw.statistics?.digg_count ?? 0),
         comments: Number(raw.statistics?.comment_count ?? 0),
