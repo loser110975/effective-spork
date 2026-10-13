@@ -1,4 +1,4 @@
-// settingsSanitize.ts — 设置数值消毒与 data.json 抢救判定（第十一轮引入，第十二轮内部重构）。
+// settingsSanitize.ts — 设置数值消毒与 data.json / 双文件布局抢救判定（第十一轮引入，第十二轮内部重构）。
 //
 // 背景：设置页 onChange 只消毒键盘输入；data.json 手改 / 外部工具写入 / 旧版本残留的
 // 非法数值（NaN / 字符串 / null）会原样进入运行时。危害链以 maxTranscribePerSync=NaN 最重：
@@ -8,10 +8,12 @@
 // REUSE_ONLY_CAP 双双失效）。逐项钳制口径与 settings.ts onChange 保持一致。
 //
 // 对外契约（第十一轮定稿；第十二轮增补：删除死导出 NUMERIC_RULE_FALLBACKS、
-// 数组一律按损坏处理——数组不是合法的 settings/state 容器）：
+// 数组一律按损坏处理——数组不是合法的 settings/state 容器；存储拆分轮增补 payloadNeedsRescue）：
 // - sanitizeNumericSettings 就地修改并返回同一对象；合法值原样保留（含数值的取整与钳制）；
-// - needsBackupRescue「settings 不是非空对象即抢救」；settings={} 视为存在；settings=数组 → 抢救；
-// - pickSettingsSource 按「settings 对象 / 损坏回默认 / 旧版扁平兼容」三规则挑合并来源；
+// - needsBackupRescue「复合结构的 settings 不是非空对象即抢救」（旧 data.json 及其 .bak）；settings={} 视为存在；settings=数组 → 抢救；
+// - payloadNeedsRescue「单文件载荷非非空对象即损坏」（新布局 settings.json/state.json 逐文件抢救）；
+// - pickSettingsSource 按「settings 对象 / 损坏回默认 / 旧版扁平兼容」三规则挑合并来源
+//   （新布局迁移时对旧 data.json 复合结构同样适用）；
 // - fallbackMatchesDefaults 校验 fallback 清单与 DEFAULT_SETTINGS 同步（漂移即测试红）。
 import { DEFAULT_SETTINGS, type DouyinSyncSettings } from "./types/settings";
 
@@ -88,6 +90,16 @@ export function sanitizeNumericSettings(s: DouyinSyncSettings): DouyinSyncSettin
 export function needsBackupRescue(data: unknown): boolean {
   if (!isObjectLike(data)) return true;
   return !isObjectLike(data.settings);
+}
+
+/**
+ * 单文件载荷抢救判定（存储拆分轮新增，settings.json/state.json 双文件布局适配）：
+ * 新布局里每个文件载荷就是对象本体（不再是 {settings, state} 复合结构），
+ * 「非非空对象即损坏」——口径与 isObjectLike 一致，供 pluginStorage 的逐文件抢救链使用。
+ * 旧 data.json 复合结构的判定仍走 needsBackupRescue（检查 settings 键域）。
+ */
+export function payloadNeedsRescue(raw: unknown): boolean {
+  return !isObjectLike(raw);
 }
 
 /**

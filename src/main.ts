@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile, addIcon, normalizePath, requestUrl } from "obsidian";
+import { Notice, Plugin, TFile, addIcon, requestUrl } from "obsidian";
 import * as path from "path";
 import type { BridgeProcessManagerState } from "./types/state";
 import { DEFAULT_SETTINGS, type DouyinSyncSettings } from "./types/settings";
@@ -11,7 +11,8 @@ import { OcrResultModal, ocrWithFallback, pickImageFile, pushVisionRecord, readI
 import { pushSummaryRecord } from "./statusCore";
 import { generateSummaryForFile } from "./summaryService";
 import { statusVisual } from "./statusCore";
-import { needsBackupRescue, pickSettingsSource, sanitizeNumericSettings } from "./settingsSanitize";
+import { pickSettingsSource, sanitizeNumericSettings } from "./settingsSanitize";
+import { PluginFileStore, SETTINGS_FILE, STATE_FILE } from "./pluginStorage";
 // nodeRequire 已随 P2-1 迁出（spawn 实现整体移至 ProcessManager.ensureRunning）
 import { fsExists, resolveNodeExe } from "./util";
 
@@ -73,7 +74,7 @@ export default class DouyinSyncPlugin extends Plugin {
     this.engine = new SyncEngine(
       this.app,
       this.settings,
-      () => this.saveSettings(), // state 与 settings 存在同一 data.json
+      () => this.saveStateFile(), // 引擎节流落盘只写 state.json（settings 与 state 已拆双文件）
       (t) => this.setStatusBar(t),
       () => this.spawnBridge(),
     );
@@ -228,100 +229,56 @@ export default class DouyinSyncPlugin extends Plugin {
   }
 
   async loadSettings() {
-    // F4（第十轮）：主文件损坏/为空时从 data.json.bak 抢救。data.json 全量非原子写（truncate-write），
-    // 写盘中段被杀（断电/强杀）会留下截断文件——本项目有过截断事故前科，截断即台账与全部 Key
-    // 一次归零。bak 由 saveSettings 周期性落成（落后主文件 ≤10 分钟，可接受）。
-    let data: any = null;
-    try {
-      data = (await this.loadData()) ?? null;
-    } catch {
-      data = null;
-    }
-    if (needsBackupRescue(data)) {
-      try {
-        const adapter = this.app.vault.adapter;
-        // 第十轮复审批：bak 之外再探 .bak.tmp——备份是「copy 到 tmp 再换名」两步（见 maybeBackupData），
-        // 换名窗口被杀会留下 bak 缺失 + tmp 完整的中间态；tmp 残留也可能本身是半截 copy，
-        // JSON.parse 不过就当没有，继续探下一个候选
-        const bakCandidates = [
-          normalizePath(`${this.manifest.dir}/data.json.bak`),
-          normalizePath(`${this.manifest.dir}/data.json.bak.tmp`),
-        ];
-        for (const bakPath of bakCandidates) {
-          if (!(await adapter.exists(bakPath))) continue;
-          try {
-            const parsed = JSON.parse(await adapter.read(bakPath));
-            if (parsed && (parsed.settings || parsed.state)) {
-              data = parsed;
-              console.warn("[douyin-sync] data.json 损坏/缺失，已从备份恢复 settings/state");
-              new Notice("抖音同步：data.json 读取失败，已从备份 data.json.bak 恢复", 10000);
-              break;
-            }
-          } catch {
-            /* 该副本损坏/为空，试下一个候选 */
-          }
-        }
-      } catch {
-        /* 抢救失败按全新安装处理 */
-      }
-    }
-    // 数值消毒（第十一轮）：设置页 onChange 只消毒键盘输入，手改 data.json / 外部工具写入的
-    // NaN/字符串会让 maxTranscribePerSync=NaN 静默解除转写预算（计费失控）、slice(0,NaN) 清空
-    // 重试队列。统一在读取入口按设置页同口径钳制（详见 settingsSanitize.ts 头注释）。
-    // 合并来源守卫（第十二轮）：settings 键损坏且 .bak 抢救也失败时只用默认值，
-    // 不再回退合并整个 data（避免 state 整块/字符串索引键混入 settings 随下次落盘固化）。
-    this.settings = sanitizeNumericSettings(Object.assign({}, DEFAULT_SETTINGS, pickSettingsSource(data)));
-    // 兼容：state 存在 settings 旁
-    this._stateRaw = data?.state;
+    // 存储拆分轮：data.json → settings.json / state.json 双文件。读路径三段：
+    // ① 双新文件齐全 → 读新（损坏先走各自 .bak 抢救链）；
+    // ② 旧 data.json 存在 → 自动迁移（按键域拆分写双新文件，data.json 原样保留作回滚锚点）；
+    // ③ 都没有 → 全新安装。任何损坏都降级为 Notice + 默认值，不让插件加载失败。
+    const dir = this.manifest.dir || "";
+    this.store = new PluginFileStore(this.app.vault.adapter, dir);
+    const result = await this.store.load();
+    for (const n of result.notices) new Notice(n, 12000);
+    // settings 消毒口径与旧版一致：pickSettingsSource 吃 {settings: 载荷} 合成复合结构——
+    // 载荷是对象本体 → 直接采用；损坏/缺失 → {}（只用默认值）；旧扁平 data.json 兼容仍在函数内。
+    this.settings = sanitizeNumericSettings(
+      Object.assign({}, DEFAULT_SETTINGS, pickSettingsSource({ settings: result.settings })),
+    );
+    // state 载荷直接进引擎（engine.loadState 自带形状消毒）
+    this._stateRaw = result.state;
   }
 
   private _stateRaw?: unknown;
 
-  /** F4（第十轮）：距上次备份 ≥10 分钟时把 data.json 复制为同目录 data.json.bak（成功落盘后调用）。
-   *  第十轮复审批两处加固：① copy 先落 .bak.tmp 再换名——adapter.copy 直接覆盖旧备份的话，
-   *  copy 中段被杀（与主文件写坏是独立事件，完全可能叠加）会把**唯一的好备份**变成半截文件，
-   *  F4 的抢救通道随之整体失效；同目录 rename 是元数据操作，bak 永远要么旧完整要么新完整。
-   *  ② lastBakAt 在成功后才记账——原实现在 copy 前置位，失败后 10 分钟内不重试。 */
-  private async maybeBackupData(): Promise<void> {
-    const now = Date.now();
-    if (now - this.lastBakAt < 10 * 60_000) return;
-    try {
-      const adapter = this.app.vault.adapter;
-      const dataPath = normalizePath(`${this.manifest.dir}/data.json`);
-      const bakPath = normalizePath(`${this.manifest.dir}/data.json.bak`);
-      if (!(await adapter.exists(dataPath))) return;
-      const tmpPath = normalizePath(`${this.manifest.dir}/data.json.bak.tmp`);
-      await adapter.copy(dataPath, tmpPath);
-      try {
-        if (await adapter.exists(bakPath)) await adapter.remove(bakPath);
-      } catch {
-        /* remove 失败让下一步 rename 失败，走外层 catch 下轮重试 */
-      }
-      await adapter.rename(tmpPath, bakPath);
-      this.lastBakAt = now;
-    } catch {
-      /* 备份失败不影响主流程（主文件仍是权威数据）；lastBakAt 未置位，下次落盘即重试 */
-    }
-  }
+  /** 双文件存储（loadSettings 时创建）：原子写 + 各自 .bak 备份链，旧 data.json 只读不写。 */
+  private store!: PluginFileStore;
 
-  private lastBakAt = 0;
+  /** F4 抢救与备份链已随存储拆分轮迁入 PluginFileStore（各文件独立 .bak，10 分钟节流）：
+   *  旧 data.json 只读不写，作为迁移回滚锚点原样保留。 */
 
   async saveSettings() {
-    // 串行写链（复审 P2）：data.json 全量 ~700KB 且非原子写，引擎落盘（节流队列只串行化引擎侧）、
-    // 设置防抖、PM persist、OCR/摘要台账写入并发到达时，两个 write 交错有截断/混写风险
-    //（本项目有过 data.json 截断事故前科）。所有调用方收口到同一条 Promise 链。
-    const p = this.saveChain.then(() =>
-      this.saveData({
-        settings: this.settings,
-        state: this.engine?.state ?? this._stateRaw,
-      }),
-    );
+    // 串行写链（复审 P2 沿用）：所有调用方收口到同一条 Promise 链，避免并发写交错。
+    // 存储拆分后本方法写双文件：settings.json（设置）+ state.json（台账快照）——
+    // OCR/摘要/PM persist 等改完 state 再调 saveSettings 的既有调用点语义不变。
+    const store = this.store;
+    const p = this.saveChain.then(async () => {
+      await store.writeJson(SETTINGS_FILE, this.settings);
+      await store.writeJson(STATE_FILE, this.engine?.state ?? this._stateRaw ?? {});
+    });
     this.saveChain = p.then(
       () => undefined,
       () => undefined,
     );
     await p;
-    void this.maybeBackupData();
+  }
+
+  /** 引擎节流落盘专用（onStateChange）：只写 state.json，不再连带全量序列化 settings。 */
+  private async saveStateFile(): Promise<void> {
+    const store = this.store;
+    const p = this.saveChain.then(() => store.writeJson(STATE_FILE, this.engine?.state ?? this._stateRaw ?? {}));
+    this.saveChain = p.then(
+      () => undefined,
+      () => undefined,
+    );
+    await p;
   }
 
   /**
