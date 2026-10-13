@@ -1,6 +1,6 @@
 import { requestUrl } from "obsidian";
-import { AsrProvider, AsrResult } from "../types";
-import { DEFAULT_SETTINGS } from "../types";
+import type { AsrProvider, AsrResult } from "../types/asr";
+import { DEFAULT_SETTINGS } from "../types/settings";
 import { sleep } from "../util";
 import { baseUrlProblem } from "../aiConfig";
 import { DouyinClient, downloadVideoBytes } from "../douyinClient";

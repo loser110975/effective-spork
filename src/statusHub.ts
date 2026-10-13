@@ -2,7 +2,7 @@
 // 设计依据：delivery/系统设计.md §3.2.M4（含 9 行联合迁移表）；验收标准：UserStory §5.4 / §5.5。
 // 本项目相对四个标杆的自研增量：显式建模「进程存活」×「连接可达」两个正交状态。
 import { requestUrl } from "obsidian";
-import type { DouyinSyncSettings } from "./types";
+import type { DouyinSyncSettings } from "./types/settings";
 import {
   ANOMALY_TEXT,
   classifyAnomaly,
@@ -13,7 +13,7 @@ import {
   type ProcessState,
   type StatusVisual,
 } from "./statusCore";
-import type { NotifyFn } from "./processManager";
+import type { NotifyFn } from "./types/host";
 
 export interface StatusSnapshot {
   processState: ProcessState;

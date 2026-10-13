@@ -4,7 +4,9 @@
 // 摘要为纯文本、不嵌照片——关键帧统一放笔记的「关键帧」折叠块。
 // 写入零覆盖约束与 summaryService 相同：只动 frontmatter summary / summary_v 与摘要折叠块。
 import { App, TFile, TFolder, Vault, normalizePath } from "obsidian";
-import type { DouyinSyncSettings, SummaryRecord, SummaryStyle } from "./types";
+import type { DouyinSyncSettings } from "./types/settings";
+import type { SummaryRecord } from "./types/state";
+import type { SummaryStyle } from "./types/settings";
 import { AiClient } from "./ai";
 import { resolveVideoSummaryChannel } from "./aiConfig";
 import { stripFrameMarkers, applySummaryToNote, upsertFmScalar, pickEvenly } from "./statusCore";

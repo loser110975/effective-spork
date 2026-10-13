@@ -8,7 +8,8 @@ import * as perfMod from "../src/perf";
 import * as concurrency from "../src/concurrency";
 import * as noteBuilder from "../src/noteBuilder";
 import * as douyinClient from "../src/douyinClient";
-import * as typesMod from "../src/types";
+import * as typesMod from "../src/types/domain";
+import * as typesSettingsMod from "../src/types/settings";
 import * as aiConfigMod from "../src/aiConfig";
 import * as videoSummaryServiceMod from "../src/videoSummaryService";
 import * as relatedNotesMod from "../src/relatedNotes";
@@ -28,6 +29,7 @@ export const m = {
   ...noteBuilder,
   ...douyinClient,
   ...typesMod,
+  ...typesSettingsMod,
   ...aiConfigMod,
   ...videoSummaryServiceMod,
   ...relatedNotesMod,

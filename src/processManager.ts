@@ -4,12 +4,18 @@
 //       桥接子进程 stderr 捕获保留尾巴，失败时随提示输出（消除「stdio:ignore」导致的诊断黑洞）。
 import { requestUrl, type RequestUrlParam } from "obsidian";
 import * as path from "path";
-import type { BridgeProcessManagerState, DouyinSyncSettings } from "./types";
+import type { BridgeProcessManagerState } from "./types/state";
+import type { DouyinSyncSettings } from "./types/settings";
 import { isNumericPid, parsePidsFromNetstat, type AnomalyCode, type ProcessState } from "./statusCore";
 import { nodeRequire, resolveNodeExe } from "./util";
 
-/** 分级提示通道（P0~P3），与 M4 StatusHub 共用同一实现。 */
-export type NotifyFn = (level: "P0" | "P1" | "P2" | "P3", code: string, msg: string) => void;
+/**
+ * 分级提示通道（P0~P3），与 M4 StatusHub 共用同一实现。
+ * 定义已移入 types/host.ts（2026-10 类型域拆分：消除 statusHub → processManager 的 type-only 环）；
+ * 此处保留 re-export 兼容 main.ts 等既有 import 方。
+ */
+export type { NotifyFn } from "./types/host";
+import type { NotifyFn } from "./types/host";
 
 export interface ProcessManagerDeps {
   getSettings(): DouyinSyncSettings;

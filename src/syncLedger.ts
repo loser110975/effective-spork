@@ -6,7 +6,9 @@
 // SyncEngine 保留编排职责并持有 ledger 实例；台账本体（state）由 ledger 持有，
 // SyncEngine 经 getter/setter 透传（loadState/resetState 的整体替换语义不变）。
 import { App, TFile, normalizePath } from "obsidian";
-import { DouyinSyncSettings, SyncState, AsrResult } from "./types";
+import type { DouyinSyncSettings } from "./types/settings";
+import type { SyncState } from "./types/state";
+import type { AsrResult } from "./types/asr";
 import { nowIso } from "./util";
 
 /**

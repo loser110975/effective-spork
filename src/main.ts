@@ -1,6 +1,7 @@
 import { Notice, Plugin, TFile, addIcon, normalizePath, requestUrl } from "obsidian";
 import * as path from "path";
-import { BridgeProcessManagerState, DouyinSyncSettings, DEFAULT_SETTINGS } from "./types";
+import type { BridgeProcessManagerState } from "./types/state";
+import { DEFAULT_SETTINGS, type DouyinSyncSettings } from "./types/settings";
 import { DouyinSyncSettingTab } from "./settings";
 import { SyncEngine, SyncSummary } from "./syncEngine";
 import { ProcessManager, type NotifyFn, type ProcResult } from "./processManager";

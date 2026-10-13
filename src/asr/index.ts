@@ -1,4 +1,6 @@
-import { AsrProvider, AsrProviderKind, AsrHooks, DouyinSyncSettings } from "../types";
+import type { AsrProvider, AsrHooks } from "../types/asr";
+import type { AsrProviderKind } from "../types/settings";
+import type { DouyinSyncSettings } from "../types/settings";
 import { DashscopeParaformer, DashscopeQwen3Asr } from "./dashscope";
 import { SiliconflowSenseVoice } from "./siliconflow";
 import { VolcengineAsr } from "./volcengine";

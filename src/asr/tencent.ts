@@ -1,6 +1,7 @@
 import { requestUrl } from "obsidian";
 import { createHash, createHmac } from "crypto";
-import { AsrProvider, AsrResult, DEFAULT_SETTINGS } from "../types";
+import type { AsrProvider, AsrResult } from "../types/asr";
+import { DEFAULT_SETTINGS } from "../types/settings";
 import { baseUrlProblem } from "../aiConfig";
 import { classifyAsrFailureKind } from "./failureKind";
 import { sleep } from "../util";

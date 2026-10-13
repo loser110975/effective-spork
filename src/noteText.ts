@@ -1,6 +1,6 @@
 // noteText.ts — 笔记文本手术的纯函数层（M3 SummaryService 的「原文零覆盖」保障）。
 // 不依赖 obsidian，可在 Node 中独立单元验证（见 tests/）。
-import type { SummaryRecord } from "./types";
+import type { SummaryRecord } from "./types/state";
 
 // ---------- 笔记文本手术（M3 SummaryService 的「原文零覆盖」保障） ----------
 

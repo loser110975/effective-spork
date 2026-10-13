@@ -1,4 +1,6 @@
-import { SyncItem, SOURCE_LABEL, AsrResult } from "./types";
+import type { SyncItem } from "./types/domain";
+import { SOURCE_LABEL } from "./types/domain";
+import type { AsrResult } from "./types/asr";
 import { isoFromUnix, localDate, mmss, yamlStr, fmtDuration, sanitizeFilename } from "./util";
 
 export interface NoteContentInput {

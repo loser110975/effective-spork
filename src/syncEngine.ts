@@ -10,19 +10,15 @@ import { buildNote, planNotePath } from "./noteBuilder";
 import { generateAndWriteVideoSummary, listVideoFramePaths, SUMMARY_V } from "./videoSummaryService";
 import { extractSummarySources, collectExistingAssets, applySummaryToNote, frontmatterBlock, pushSummaryRecord, type ReusedNoteAssets } from "./statusCore";
 import { applyRelatedToNote, buildRelatedBlock, pickRelatedLinks, type RelatedCandidate, type RelatedLink } from "./relatedNotes";
-import {
-  DouyinSyncSettings,
-  SyncState,
-  SyncItem,
-  DouyinAwemeRaw,
-  AsrResult,
-  StageTimings,
-  SOURCE_LABEL,
-} from "./types";
+import type { DouyinSyncSettings } from "./types/settings";
+import type { SyncState } from "./types/state";
+import type { SyncItem, DouyinAwemeRaw, ItemSource } from "./types/domain";
+import { SOURCE_LABEL } from "./types/domain";
+import type { AsrResult } from "./types/asr";
+import type { StageTimings } from "./types/state";
 import { nowIso, parseList, noteTitleFor, sleep } from "./util";
 import { isAudioOnlyItem, AUDIO_ONLY_REASON } from "./itemType";
 import { clampConcurrency, mapLimit, Semaphore } from "./concurrency";
-import type { ItemSource } from "./types";
 import { detailStageTimings, summarizeStageTimings, StageTimer } from "./perf";
 import { SyncLedger, ASR_RETRY_MAX } from "./syncLedger";
 // P2-2：确定性失败正则迁至 asr/failureKind.ts 供 provider 与引擎共用（正则文本逐字未动，仍为兜底）

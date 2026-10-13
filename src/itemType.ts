@@ -2,7 +2,7 @@
 // 不依赖 obsidian，可在 Node 中独立单元验证（见 .workbuddy/tests/）。
 // 判定依据三重信号：is_note 标志、aweme_type 类型码、images 字段——
 // 任一明确指向图文即判图文，避免单一启发式误判（2026-09 分类优化需求）。
-import { ItemType } from "./types";
+import type { ItemType } from "./types/domain";
 
 /** 抖音 aweme_type 中表示图文（图片集合）的已知取值；0/4 等为视频。 */
 export const IMAGE_AWEME_TYPES = new Set<number>([2, 68, 71]);

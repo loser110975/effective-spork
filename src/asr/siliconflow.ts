@@ -3,7 +3,8 @@
 // multipart 上传到 <Base URL>/audio/transcriptions。响应 {"text": "..."}，无时间戳。
 // 接入方式：Base URL（settings.siliconflowBaseUrl，默认官方端点）+ API Key（settings.siliconflowKey）。
 import { requestUrl, type RequestUrlParam } from "obsidian";
-import { AsrProvider, AsrResult, AsrTranscribeOpts, AudioResolver, DEFAULT_SETTINGS } from "../types";
+import type { AsrProvider, AsrResult, AsrTranscribeOpts, AudioResolver } from "../types/asr";
+import { DEFAULT_SETTINGS } from "../types/settings";
 import { baseUrlProblem } from "../aiConfig";
 import { nodeRequire } from "../util";
 import { classifyAsrFailureKind } from "./failureKind";

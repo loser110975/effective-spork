@@ -8,7 +8,7 @@
 //   平均值会被长尾拉偏，中位数才反映「典型一条要多久」。
 // - 只列 ≥0.2s 的阶段并最多列 4 个：避免输出被一堆 0.0s 的阶段淹没。
 
-import type { StageTimings } from "./types";
+import type { StageTimings } from "./types/state";
 
 /** 参与统计的数值字段（显式列出，避免把 id / type / recordedAt 当数字处理）。 */
 type NumericKey =

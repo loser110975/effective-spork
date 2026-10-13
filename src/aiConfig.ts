@@ -2,7 +2,7 @@
 // 所有 AI 调用（OpenAI 兼容 Chat Completions / 各 ASR 服务）的 Base URL 与 API Key
 // 一律从插件设置（settings → data.json）解析，代码里不写死任何接入点。
 // 任一通道配置缺失或无效时，由本模块生成指向设置页的明确错误信息。
-import { DEFAULT_SETTINGS, DouyinSyncSettings } from "./types";
+import { DEFAULT_SETTINGS, DouyinSyncSettings } from "./types/settings";
 
 export interface ResolvedChannel {
   baseUrl: string;

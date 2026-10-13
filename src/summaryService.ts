@@ -3,7 +3,8 @@
 // 零覆盖约束：只允许「新增/替换 frontmatter summary 属性」与「插入/原位替换摘要折叠块」，
 // 严禁触碰 `[!quote]- 逐字稿` 与 `[!note]- 图片文字` 折叠块（UserStory §5.3.6 AC）。
 import { App, Notice, TFile } from "obsidian";
-import type { DouyinSyncSettings, SummaryRecord } from "./types";
+import type { DouyinSyncSettings } from "./types/settings";
+import type { SummaryRecord } from "./types/state";
 import { extractSummarySources, applySummaryToNote, frontmatterBlock } from "./statusCore";
 import { AiClient } from "./ai";
 import { resolveAiChannel } from "./aiConfig";

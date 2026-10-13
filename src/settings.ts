@@ -1,11 +1,11 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
-import type DouyinSyncPlugin from "./main";
+import type { PluginHost } from "./types/host";
 import { ASR_PROVIDER_LABELS } from "./asr";
-import { AsrProviderKind, DEFAULT_SETTINGS, SUMMARY_STYLE_LABELS, type SummaryStyle } from "./types";
+import { AsrProviderKind, DEFAULT_SETTINGS, SUMMARY_STYLE_LABELS, type SummaryStyle } from "./types/settings";
 import { statusVisual } from "./statusCore";
 
 export class DouyinSyncSettingTab extends PluginSettingTab {
-  plugin: DouyinSyncPlugin;
+  plugin: PluginHost;
   /** 实时状态行订阅（display() 重建时清理，防泄漏） */
   private statusUnsubs: (() => void)[] = [];
   /** 文本输入防抖落盘句柄（data.json 含完整 state，逐键全量序列化纯属浪费 IO） */
@@ -47,7 +47,7 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
     this.effectFn = null;
   }
 
-  constructor(app: App, plugin: DouyinSyncPlugin) {
+  constructor(app: App, plugin: PluginHost) {
     super(app, plugin);
     this.plugin = plugin;
   }

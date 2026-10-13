@@ -3,7 +3,7 @@
 // 各 provider 返回失败结果时按本模块 classifyAsrFailureKind 打 failureKind 标；
 // syncEngine.transcribeVideo 先读结构化字段，字段缺失时回退正则——任何 provider 漏标时
 // 重试队列进出判定与改造前逐条一致。
-import { AsrFailureKind } from "../types";
+import type { AsrFailureKind } from "../types/asr";
 
 /**
  * 「确定性失败」特征（2026-09-21 P2）：素材侧 / 条目结构 / 通道配置问题，

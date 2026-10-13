@@ -5,7 +5,7 @@
 import { requestUrl, Vault, normalizePath, TFile, TFolder } from "obsidian";
 import * as path from "path";
 import { DouyinClient, downloadVideoBytes } from "./douyinClient";
-import { DouyinSyncSettings } from "./types";
+import type { DouyinSyncSettings } from "./types/settings";
 import { ensureFolder } from "./media";
 import { nodeRequireFn, DOUYIN_UA } from "./util";
 

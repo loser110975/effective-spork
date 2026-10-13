@@ -2,7 +2,8 @@
 // 设计依据：delivery/系统设计.md §3.2.M2、§4.2.4；验收标准：UserStory §5.2。
 // 关键约束：主通道失败**不自动回退**，必须弹确认、经用户同意才调用付费通道（经中间确认）。
 import { App, Modal, Notice, TFile } from "obsidian";
-import type { DouyinSyncSettings, VisionRecord } from "./types";
+import type { DouyinSyncSettings } from "./types/settings";
+import type { VisionRecord } from "./types/state";
 import { appendOcrToNoteCallout, imageMimeFromName } from "./statusCore";
 import { AiClient } from "./ai";
 import { resolveOcrPanelChannel } from "./aiConfig";

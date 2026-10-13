@@ -1,5 +1,5 @@
 import { requestUrl, RequestUrlParam, RequestUrlResponse } from "obsidian";
-import { DouyinAwemeRaw, DouyinPage, SyncItem, ItemType } from "./types";
+import type { DouyinAwemeRaw, DouyinPage, SyncItem, ItemType } from "./types/domain";
 import { noWatermark, DOUYIN_UA } from "./util";
 import { classifyItemType } from "./itemType";
 

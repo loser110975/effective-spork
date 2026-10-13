@@ -13,7 +13,7 @@
 // - needsBackupRescue「settings 不是非空对象即抢救」；settings={} 视为存在；settings=数组 → 抢救；
 // - pickSettingsSource 按「settings 对象 / 损坏回默认 / 旧版扁平兼容」三规则挑合并来源；
 // - fallbackMatchesDefaults 校验 fallback 清单与 DEFAULT_SETTINGS 同步（漂移即测试红）。
-import { DEFAULT_SETTINGS, DouyinSyncSettings } from "./types";
+import { DEFAULT_SETTINGS, type DouyinSyncSettings } from "./types/settings";
 
 interface NumericRule {
   key: keyof DouyinSyncSettings;

@@ -1,7 +1,8 @@
 // panelView.ts — 插件管理面板（侧栏视图）：二维状态总览 + 启停重启 + 详情 + OCR/摘要入口。
 // 设计依据：delivery/UserStory.md §5.1（US-1 七段式）、§5.4.3（状态灯对照表）、§5.5.3（异常内联块）。
 import { ItemView, WorkspaceLeaf } from "obsidian";
-import type { BridgeProcessManagerState, DouyinSyncSettings } from "./types";
+import type { BridgeProcessManagerState } from "./types/state";
+import type { DouyinSyncSettings } from "./types/settings";
 import type { ProcessManager } from "./processManager";
 import { renderStatusBadge, type StatusSnapshot } from "./statusHub";
 import { formatRss } from "./statusCore";
