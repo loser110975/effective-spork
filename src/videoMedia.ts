@@ -4,7 +4,7 @@
 // 刷新播放地址）→ 本地文件再跑同一命令。帧图入库 vault，音频留 OS 临时目录供上传。
 import { requestUrl, Vault, normalizePath, TFile, TFolder } from "obsidian";
 import * as path from "path";
-import { DouyinClient } from "./douyinClient";
+import { DouyinClient, downloadVideoBytes } from "./douyinClient";
 import { DouyinSyncSettings } from "./types";
 import { ensureFolder } from "./media";
 import { nodeRequireFn, DOUYIN_UA } from "./util";
@@ -12,7 +12,7 @@ import { nodeRequireFn, DOUYIN_UA } from "./util";
 const BROWSER_UA = DOUYIN_UA;
 const FFMPEG_TIMEOUT_MS = 8 * 60 * 1000; // 单次 ffmpeg 执行上限
 const MAX_VIDEO_SEC = 600; // 只处理前 10 分钟（抖音视频极少超过；同时控住 SenseVoice 上传体积）
-const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
+// 200MB 上限 / 1KB 下限判定已随 P2-3 合并至 douyinClient.downloadVideoBytes（DOWNLOAD_VIDEO_* 常量）
 const MAX_FRAMES = 100; // 关键帧硬上限（按抽帧间隔自然达成的封顶）
 const MIN_FRAMES = 4; // 短视频保底帧数：帧是多模态模型的画面上下文，太稀会看不全全程
 const MIN_AUDIO_BYTES = 1024; // 小于此值的 audio.mp3 视为无效（0 字节 / ffmpeg 空壳产物）
@@ -590,28 +590,8 @@ export class VideoMediaStore {
     return out;
   }
 
-  /** 本地下载视频字节；URL 失效（403 签名过期）时经桥接刷新播放地址重试一次。 */
+  /** 本地下载视频字节；URL 失效（403 签名过期）时经桥接刷新播放地址重试一次（P2-3：共享实现见 douyinClient.downloadVideoBytes）。 */
   private async downloadVideo(url: string, videoId: string): Promise<ArrayBuffer> {
-    const headers = { "User-Agent": BROWSER_UA, Referer: "https://www.douyin.com/" };
-    // 显式超时（复审 P2）：上限 200MB 的全片下载受 requestUrl 默认 ~30s 摆布必被掐断，放宽到 10 分钟
-    let res = await requestUrl({ url, method: "GET", headers, throw: false, timeout: 600_000 } as any);
-    if (res.status >= 400 && this.client) {
-      const raw = await this.client.getAwemeDetail(videoId);
-      const fresh = raw ? DouyinClient.normalize(raw as any, "collection") : null;
-      if (fresh?.playUrl && fresh.playUrl !== url) {
-        res = await requestUrl({ url: fresh.playUrl, method: "GET", headers, throw: false, timeout: 600_000 } as any);
-      }
-    }
-    if (res.status >= 400) {
-      throw new Error(`HTTP ${res.status}（CDN 拒绝，播放地址可能已过期）`);
-    }
-    const buf = res.arrayBuffer;
-    if (buf.byteLength > MAX_VIDEO_BYTES) {
-      throw new Error(`视频超过 ${MAX_VIDEO_BYTES / 1024 / 1024}MB 上限`);
-    }
-    if (buf.byteLength < 1024) {
-      throw new Error(`视频字节数异常（${buf.byteLength}B）`);
-    }
-    return buf;
+    return downloadVideoBytes(url, { client: this.client, videoId, errorStyle: "media" });
   }
 }

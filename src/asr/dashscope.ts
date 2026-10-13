@@ -3,7 +3,7 @@ import { AsrProvider, AsrResult } from "../types";
 import { DEFAULT_SETTINGS } from "../types";
 import { sleep } from "../util";
 import { baseUrlProblem } from "../aiConfig";
-import { DouyinClient } from "../douyinClient";
+import { DouyinClient, downloadVideoBytes } from "../douyinClient";
 
 /**
  * 阿里云百炼 DashScope — Paraformer 录音文件识别（异步任务）。
@@ -15,9 +15,6 @@ import { DouyinClient } from "../douyinClient";
  * 通道 B（自动回退）：本地下载视频字节 → 百炼临时 OSS（getPolicy + multipart 上传）
  *   → file_urls 传 oss:// 地址（需 X-DashScope-OssResourceResolve: enable）。
  */
-
-const BROWSER_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
 // 通道 A 失败后值得走上传通道的错误特征（CDN 拒绝云端拉取 / URL 失效）
 const NEED_FALLBACK_RE = /FILE_403_FORBIDDEN|FILE_DOWNLOAD/i;
@@ -279,30 +276,9 @@ export class DashscopeParaformer implements AsrProvider {
 
   // ---------- 通道 B：下载 / 凭证 / 上传 ----------
 
-  /** 本地下载视频字节。URL 失效时经桥接刷新播放地址重试一次。 */
+  /** 本地下载视频字节。URL 失效时经桥接刷新播放地址重试一次（P2-3：共享实现见 douyinClient.downloadVideoBytes）。 */
   private async fetchVideoBytes(url: string, videoId: string): Promise<ArrayBuffer> {
-    const headers = { "User-Agent": BROWSER_UA, Referer: "https://www.douyin.com/" };
-    // 显式超时（复审 P2）：上限 200MB 的全片下载受 requestUrl 默认 ~30s 摆布必被掐断，放宽到 10 分钟
-    let res = await requestUrl({ url, method: "GET", headers, throw: false, timeout: 600_000 } as any);
-    if (res.status >= 400 && this.client) {
-      // 播放地址通常带 expires 签名，过期即 403 —— 经桥接重新拿 detail 刷新
-      const raw = await this.client.getAwemeDetail(videoId);
-      const fresh = raw ? DouyinClient.normalize(raw as any, "collection") : null;
-      if (fresh?.playUrl && fresh.playUrl !== url) {
-        res = await requestUrl({ url: fresh.playUrl, method: "GET", headers, throw: false, timeout: 600_000 } as any);
-      }
-    }
-    if (res.status >= 400) {
-      throw new Error(`视频下载失败 HTTP ${res.status}（CDN 拒绝）`);
-    }
-    const buf = res.arrayBuffer;
-    if (buf.byteLength > 200 * 1024 * 1024) {
-      throw new Error(`视频超过 200MB（${(buf.byteLength / 1048576).toFixed(0)}MB），跳过上传通道`);
-    }
-    if (buf.byteLength < 1024) {
-      throw new Error(`视频字节数异常（${buf.byteLength}B）`);
-    }
-    return buf;
+    return downloadVideoBytes(url, { client: this.client, videoId, errorStyle: "upload" });
   }
 
   private async getUploadPolicy(model?: string) {

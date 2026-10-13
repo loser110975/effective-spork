@@ -447,3 +447,60 @@ export class DouyinClient {
     };
   }
 }
+
+// ---------- 共享视频字节下载（P2-3：合并 videoMedia.downloadVideo 与 asr/dashscope.fetchVideoBytes） ----------
+
+/** 全片下载字节上限：超出视为异常输入（videoMedia 与 dashscope 上传通道同口径） */
+const DOWNLOAD_VIDEO_MAX_BYTES = 200 * 1024 * 1024;
+/** 低于此值的响应体视为无效（0 字节 / 反爬空壳页） */
+const DOWNLOAD_VIDEO_MIN_BYTES = 1024;
+/** 显式超时（复审 P2）：上限 200MB 的全片下载受 requestUrl 默认 ~30s 摆布必被掐断，放宽到 10 分钟 */
+const DOWNLOAD_VIDEO_TIMEOUT_MS = 600_000;
+
+/**
+ * 本地下载视频字节；URL 失效（403 等签名过期）时经桥接刷新播放地址重试一次。
+ * UA/Referer 头、403 刷新重试（仅一次、播放地址变化才重发）、200MB/1KB 边界判定、600s 超时
+ * —— 两处历史调用点（videoMedia / asr dashscope）行为逐位一致，仅错误文案口径不同，
+ * 由 errorStyle 参数逐字保留各自历史文案（错误串会被上层捕获拼接，属用户可见行为）。
+ */
+export async function downloadVideoBytes(
+  url: string,
+  opts: {
+    /** 播放地址失效时经 getAwemeDetail 刷新 detail 的桥接客户端；为空则不刷新（与历史 client 为空分支一致） */
+    client?: DouyinClient | null;
+    /** 刷新 detail 用的视频 id */
+    videoId: string;
+    /** 错误文案口径：media = videoMedia 历史、upload = dashscope 上传通道历史 */
+    errorStyle: "media" | "upload";
+  },
+): Promise<ArrayBuffer> {
+  const headers = { "User-Agent": DOUYIN_UA, Referer: "https://www.douyin.com/" };
+  let res = await requestUrl({ url, method: "GET", headers, throw: false, timeout: DOWNLOAD_VIDEO_TIMEOUT_MS } as any);
+  if (res.status >= 400 && opts.client) {
+    // 播放地址通常带 expires 签名，过期即 403 —— 经桥接重新拿 detail 刷新
+    const raw = await opts.client.getAwemeDetail(opts.videoId);
+    const fresh = raw ? DouyinClient.normalize(raw as any, "collection") : null;
+    if (fresh?.playUrl && fresh.playUrl !== url) {
+      res = await requestUrl({ url: fresh.playUrl, method: "GET", headers, throw: false, timeout: DOWNLOAD_VIDEO_TIMEOUT_MS } as any);
+    }
+  }
+  if (res.status >= 400) {
+    throw new Error(
+      opts.errorStyle === "media"
+        ? `HTTP ${res.status}（CDN 拒绝，播放地址可能已过期）`
+        : `视频下载失败 HTTP ${res.status}（CDN 拒绝）`,
+    );
+  }
+  const buf = res.arrayBuffer;
+  if (buf.byteLength > DOWNLOAD_VIDEO_MAX_BYTES) {
+    throw new Error(
+      opts.errorStyle === "media"
+        ? `视频超过 ${DOWNLOAD_VIDEO_MAX_BYTES / 1024 / 1024}MB 上限`
+        : `视频超过 200MB（${(buf.byteLength / 1048576).toFixed(0)}MB），跳过上传通道`,
+    );
+  }
+  if (buf.byteLength < DOWNLOAD_VIDEO_MIN_BYTES) {
+    throw new Error(`视频字节数异常（${buf.byteLength}B）`);
+  }
+  return buf;
+}
