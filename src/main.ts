@@ -12,7 +12,7 @@ import { generateSummaryForFile } from "./summaryService";
 import { statusVisual } from "./statusCore";
 import { needsBackupRescue, pickSettingsSource, sanitizeNumericSettings } from "./settingsSanitize";
 // nodeRequire 已随 P2-1 迁出（spawn 实现整体移至 ProcessManager.ensureRunning）
-import { fsExists } from "./util";
+import { fsExists, resolveNodeExe } from "./util";
 
 const SYNC_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9"/><polyline points="21 3 21 9 15 9"/><path d="M9 10v4l3 2"/></svg>`;
 
@@ -327,6 +327,17 @@ export default class DouyinSyncPlugin extends Plugin {
     const { DouyinClient } = await import("./douyinClient"); // 仅在用户测试时加载请求客户端。
     const bridgeUrl = this.settings.bridgeEnabled ? this.settings.bridgeUrl : undefined; // 开关关闭时明确选择直连。
     const channelLabel = bridgeUrl ? "（经本地桥接）" : "（直连，未走桥接）"; // 反馈中显示真实通道，便于定位风控。
+
+    // nodepath 过期加固（U1）：走桥接通道且配置了 Node 路径时，拉起前先做文件存在性快检——
+    // 路径已失效立即 Notice 并按回退路径继续完成测试，绝不空等 15s 超时后才见到 ENOENT。
+    // 决策复用 util.resolveNodeExe（与 spawn 侧同一纯函数）；后续 spawn 由 ProcessManager
+    // 的同名逻辑自动回退 PATH node，本处只负责「立即有感知」。
+    if (bridgeUrl) {
+      const resolved = resolveNodeExe({ bridgeNodePath: this.settings.bridgeNodePath });
+      if (resolved.stalePath) {
+        new Notice(`Node 路径文件不存在：${resolved.stalePath}，已自动回退 PATH node 重试`);
+      }
+    }
 
     try {
       const client = new DouyinClient(this.settings.cookie, bridgeUrl, () => this.spawnBridge()); // 桥未启动时由插件拉起。

@@ -185,7 +185,7 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
       .addToggle((t) => t.setValue(s.bridgeEnabled).onChange(async (v) => { s.bridgeEnabled = v; this.queueSave(); this.display(); }));
     if (s.bridgeEnabled) {
       new Setting(containerEl).setName("桥接地址").addText((t) => t.setValue(s.bridgeUrl).onChange(async (v) => { s.bridgeUrl = v.trim() || DEFAULT_SETTINGS.bridgeUrl; this.queueSave(); }));
-      new Setting(containerEl).setName("Node 可执行文件路径").setDesc("桥接进程未运行时用于自动拉起；留空则用 PATH 里的 node（如 C:\\Program Files\\nodejs\\node.exe）").addText((t) => t.setValue(s.bridgeNodePath).onChange(async (v) => { s.bridgeNodePath = v.trim(); this.queueSave(); }));
+      new Setting(containerEl).setName("Node 可执行文件路径").setDesc("桥接进程未运行时用于自动拉起；留空则用 PATH 里的 node（如 C:\\Program Files\\nodejs\\node.exe）；文件不存在时自动回退 PATH node 并警告").addText((t) => t.setValue(s.bridgeNodePath).onChange(async (v) => { s.bridgeNodePath = v.trim(); this.queueSave(); }));
       new Setting(containerEl).setName("playwright-core 所在 node_modules").setDesc("含 playwright-core 的 node_modules 目录，作为桥接进程的 NODE_PATH；留空则按常规 node 解析规则查找").addText((t) => t.setValue(s.bridgeNodeModules).onChange(async (v) => { s.bridgeNodeModules = v.trim(); this.queueSave(); }));
     }
 

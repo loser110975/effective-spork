@@ -336,7 +336,7 @@ export interface DouyinSyncSettings {
   // 桥接通过真实 Chromium 页面上下文代发请求，本机 127.0.0.1 不出公网）
   bridgeEnabled: boolean;
   bridgeUrl: string;
-  /** node.exe 绝对路径；留空则用 PATH 里的 node */
+  /** node.exe 绝对路径；留空则用 PATH 里的 node；文件不存在时自动回退 PATH node 并警告（每会话一次） */
   bridgeNodePath: string;
   /** 含 playwright-core 的 node_modules 目录，作为桥接进程的 NODE_PATH；留空则按常规解析 */
   bridgeNodeModules: string;

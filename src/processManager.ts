@@ -6,7 +6,7 @@ import { requestUrl, type RequestUrlParam } from "obsidian";
 import * as path from "path";
 import type { BridgeProcessManagerState, DouyinSyncSettings } from "./types";
 import { isNumericPid, parsePidsFromNetstat, type AnomalyCode, type ProcessState } from "./statusCore";
-import { nodeRequire } from "./util";
+import { nodeRequire, resolveNodeExe } from "./util";
 
 /** 分级提示通道（P0~P3），与 M4 StatusHub 共用同一实现。 */
 export type NotifyFn = (level: "P0" | "P1" | "P2" | "P3", code: string, msg: string) => void;
@@ -42,6 +42,8 @@ export class ProcessManager {
   private spawnedPids: number[] = [];
   /** 桥接子进程 stderr 尾巴（失败时附在提示里） */
   private lastStderr = "";
+  /** nodepath 过期回退的会话级去重标记：每个插件会话最多警告一次（PM 实例与通知链同生命周期） */
+  private staleNodeWarned = false;
 
   constructor(private deps: ProcessManagerDeps) {}
 
@@ -98,7 +100,9 @@ export class ProcessManager {
     if (!spawn) throw new Error("Node 运行时不可用（非桌面端或 nodeIntegration 关闭），无法拉起桥接");
     // 未配置路径时回退到 PATH 里的 node；未配置依赖目录时不写 NODE_PATH，交给常规解析。
     // 安装脚本会按目标机器把这两项写好，所以正常情况下都命中第一个分支。
-    const nodeExe = (this.s.bridgeNodePath || "").trim() || "node";
+    // nodepath 过期加固（U2）：配置路径文件已不存在时同样回退 "node"，并发一次会话级警告，
+    // 避免 spawn 异步 ENOENT 后只能空等 15s 超时
+    const nodeExe = this.resolveSpawnNodeExe();
     const env: Record<string, string | undefined> = { ...process.env };
     const modulesDir = (this.s.bridgeNodeModules || "").trim();
     if (modulesDir) env.NODE_PATH = modulesDir;
@@ -182,6 +186,24 @@ export class ProcessManager {
 
   private get s(): DouyinSyncSettings {
     return this.deps.getSettings();
+  }
+
+  /**
+   * nodepath 过期加固（U2）：spawn 前把配置路径解析成实际可执行文件。配置路径失效时
+   * 回退 PATH node 并经现有通知链（deps.notify）警告——每个插件会话最多一次。
+   * 决策逻辑在 util.resolveNodeExe 纯函数里（existsFn 注入，单测覆盖三分支）。
+   */
+  private resolveSpawnNodeExe(): string {
+    const r = resolveNodeExe({ bridgeNodePath: this.s.bridgeNodePath });
+    if (r.stalePath && !this.staleNodeWarned) {
+      this.staleNodeWarned = true;
+      this.deps.notify(
+        "P1",
+        "101001",
+        `Node 路径已失效（文件不存在）：${r.stalePath}，本次已回退 PATH node，请更新设置`,
+      );
+    }
+    return r.exe;
   }
 
   private port(): number {
@@ -439,7 +461,8 @@ export class ProcessManager {
     }
 
     // Step 2: spawn（detached / 捕获 stderr / windowsHide / NODE_PATH 注入）
-    const nodeExe = this.s.bridgeNodePath.trim() || "node";
+    // nodepath 过期加固（U2）：与 ensureRunning 共用同一决策（含会话级一次性警告）
+    const nodeExe = this.resolveSpawnNodeExe();
     const script = this.deps.bridgeScriptPath();
     const pluginDir = this.deps.pluginDir();
     if (!script) {

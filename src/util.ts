@@ -35,6 +35,32 @@ export function nodeRequire<T = any>(id: string): T | null {
   }
 }
 
+/** 「配置 → 实际可执行文件」决策结果（nodepath 过期加固）。 */
+export interface NodeExeResolution {
+  /** 实际用于 spawn 的可执行文件：配置路径有效时为原路径，否则为 PATH 上的 "node" */
+  exe: string;
+  /** 配置了但文件已不存在的原路径（stale 标记；健康路径与未配置时为空） */
+  stalePath?: string;
+}
+
+/**
+ * 配置路径 → 实际 spawn 用的 node 可执行文件（纯函数，existsFn 注入便于单测）。
+ * 三分支：未配置/空白 → "node"；配置且文件存在 → 原路径（健康路径行为零变化）；
+ * 配置但文件不存在 → 回退 "node" 并返回 stalePath 供调用方发一次性警告
+ * （事故背景：WorkBuddy 更新会换 node 版本目录并删除旧目录，data.json 里的
+ * bridgeNodePath 随之失效，spawn 异步 ENOENT 只能空等 15s 超时）。
+ */
+export function resolveNodeExe(opts: {
+  bridgeNodePath?: string | null;
+  existsFn?: (p: string) => boolean;
+}): NodeExeResolution {
+  const exists = opts.existsFn ?? fsExists;
+  const configured = (opts.bridgeNodePath ?? "").trim();
+  if (!configured) return { exe: "node" };
+  if (exists(configured)) return { exe: configured };
+  return { exe: "node", stalePath: configured };
+}
+
 /** 同步存在性检查；fs 不可用时返回 false（调用方应有候选回退或 stderr 兜底）。 */
 export function fsExists(p: string): boolean {
   const fs = nodeRequire<{ existsSync(p: string): boolean }>("fs");
