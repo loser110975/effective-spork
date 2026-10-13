@@ -250,7 +250,10 @@ export class DashscopeParaformer implements AsrProvider {
         status: "failed",
         transcript: "",
         error: detail ? `文件级失败 ${detail.slice(0, 200)}` : "结果缺 transcription_url",
-        failureKind: classifyAsrFailureKind(detail),
+        // N1（QA 备注）：classify 必须用与 error 同一截断串——引擎侧兜底正则测的是
+        // `文件级失败 ${detail.slice(0,200)}`（截断 200 字符），打标若测未截断 detail，
+        // 「关键词恰好被 200 字符截断/截在边界」时打标结果会与旧正则判定不一致
+        failureKind: classifyAsrFailureKind(detail.slice(0, 200)),
       };
     }
     let tr: any;
