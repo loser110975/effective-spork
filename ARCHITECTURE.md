@@ -328,30 +328,40 @@ ffmpeg -nostdin -y -user_agent <UA> -headers "Referer: …" -rw_timeout 60s
 
 **SenseVoice 转录**（`SiliconflowSenseVoice`）：经工厂注入的 `resolveAudio` 钩子取本地音频 → 手工拼 multipart（字段 `model` / `language` / `response_format`，`file` 最后）上传 `api.siliconflow.cn/v1/audio/transcriptions` → 解析 `{"text"}`。**无时间戳**，noteBuilder 走 800 字分段渲染。空文本 → `unavailable`（纯音乐语义，沿用「移出重试队列」约定）；取不到音频 → `failed`（ffmpeg 缺失等），入 `pendingAsr`。
 
-**多模态总结**（`generateAndWriteVideoSummary`）：帧图转 base64 data URL（累计 14MiB 截断，防百炼 16MiB 请求体红线 413）+ 转录文字（≤8000 字符）经 `AiClient.chatVision` 发给百炼视觉模型（默认 `qwen3-vl-plus`，设置可换）。提示词要求输出**结构化笔记体**：`简介：`一行 + 1~2 段概述 + `🎯 N. 小标题` 分节列表（3~8 节，**加粗**划重点）+ `🌟 小总结`——**摘要不含照片**（关键帧统一在笔记的「关键帧」折叠块），`statusCore.stripFrameMarkers` 兜底剔除模型偶发的 `【配图N】` 标记。写入：frontmatter `summary` + `summary_v: 2`（格式版本号）+ `upsertAbstractBlock`（零覆盖约束不变）。
+**多模态总结**（`generateAndWriteVideoSummary`）：帧图转 base64 data URL（累计 14MiB 截断，防百炼 16MiB 请求体红线 413）+ 转录文字（≤8000 字符）经 `AiClient.chatVision` 发给视觉模型。提示词要求输出**层级笔记体**：`主题:副题` 内容标题 + `## 引言` + 按内容逻辑分节（完整保留数据/公式/名词）+ `## 总结与意义` + `## AI 总结`——**摘要不含照片**（关键帧统一在笔记的「关键帧」折叠块），`statusCore.stripFrameMarkers` 兜底剔除偶发标记。写入：单次 `vault.process` 原子完成 frontmatter `summary` / `summary_v: 3` / `summary_style` + `upsertAbstractBlock`（零覆盖约束不变）。**摘要风格预设**（第八轮）：`videoSummaryStyle` 支持 hierarchy（默认，与 v3 提示词逐字一致）/ outline（要点速览）/ qa（问答复习体）三风格，切换风格不触发存量笔记批量重出（补跑判定仍只看 `summary_v`）。帧数超通道上限时按 8/5/2/1 档降档重试（第九轮 B1：`shouldDropToNextStep` 修复短视频×低图数上限模型的降档死锁）。
 
-**批量补跑**（`SyncEngine.backfillVideos`）：遍历 `state.processed`，读现场定位的笔记，frontmatter `type: "视频"` 且满足任一条件的条目 → `getAwemeDetail` → 走完整 `processItem` overwrite 路径：缺 `transcript_status: success`、缺摘要块、`frame_interval` 与当前设置不一致（含从未抽出帧）、`summary_v != 2`（摘要格式升级）。已有成功转录复用笔记逐字稿（构造 `asrOverride`，不重复计费 ASR）；预算复用 `maxTranscribePerSync`。图文笔记一律跳过。
+**批量补跑**（`SyncEngine.backfillVideos`）：遍历 `state.processed`，读现场定位的笔记，frontmatter `type: "视频"` 且满足任一条件的条目 → `getAwemeDetail` → 走完整 `processItem` overwrite 路径：缺 `transcript_status: success`、缺摘要块、`frame_interval` 与当前设置不一致（含从未抽出帧）、`summary_v != 3`。已有成功转录复用笔记逐字稿（构造 `asrOverride`，不重复计费 ASR）；补跑候选带 **reextractFrames 重抽意图**（第九轮 A1：帧的真实间隔随返回值走，`frame_interval` 只写帧的真实间隔，旧帧不再劫持补抽）；预算 0 语义 = 只补「可复用已有转录」的免费候选，上限 50 条（A11）。图文笔记一律跳过。
 
 ---
 
 ## 四、状态与持久化
 
-`data.json` 的完整形状：
+`data.json` 的完整形状（2026-09-28 第十二轮后；字段以 `types.ts` 为准）：
 
 ```jsonc
 {
-  "settings": { /* 39 个字段，见 types.ts DEFAULT_SETTINGS */ },
+  "settings": { /* 64 个字段，见 types.ts DEFAULT_SETTINGS；loadSettings 入口经 settingsSanitize 数值消毒（第十一轮） */ },
   "state": {
     "processed": { "<aweme_id>": { "path", "syncedAt", "folder", "asrStatus" } },  // 去重与定位
     "pendingAsr":   ["<aweme_id>"],   // 转写失败待重试，吃下次预算
-    "lastSyncAt": "...", "lastSyncSummary": "新增 0 / 转写 0 / 视频摘要 0 / 失败 0"
+    "asrRetry":     { "<aweme_id>": { "attempts", "lastError", "nextRetryAt", "dead?" } },  // 退避阶梯 + dead-letter
+    "transcriptCache": { "<aweme_id>": { "transcript", "provider", "at" } },  // FIFO ≤20：转写成功但写笔记失败时暂存，防重复计费（第九轮 B3）
+    "backfillFails": { "<aweme_id>": <连续失败次数> },  // ≥3 本轮扫描跳过，补跑成功即清除
+    "metrics":      [ StageTimings… ],  // ≤100，分阶段耗时埋点
+    "lastPerfSummary": "一行耗时画像",
+    "lastSyncAt": "...", "lastSyncSummary": "新增 0 / 转写 0 / 视频摘要 0 / 失败 0",
+    "processManager": { "bridgePid", "panelPid", "treePids", "lastStartAt", "lastStopAt", … },
+    "vision":  [ VisionRecord… ],   // ≤200
+    "summary": [ SummaryRecord… ]   // ≤200
   }
 }
 ```
 
-读取时的兼容处理：`Object.assign({}, DEFAULT_SETTINGS, data.settings ?? data)`——`?? data` 是为了兼容**早期扁平格式**（settings 直接平铺在顶层）的旧 data.json。
+读取时的兼容处理（第十二轮收口为 `main.pickSettingsSource`）：settings 是对象→用之；损坏（非对象/数组）→空来源只用默认值；无 settings 键（早期扁平格式）→顶层即 settings；data 非对象→空来源。主文件损坏/为空时从 `data.json.bak`（`.bak.tmp` 中间态兜底）抢救并 Notice 提示（第十轮 F4，写成功后 ≥10 分钟才更新备份，备份先落 tmp 再原子改名）。
 
-「重置同步状态」命令把 `state` 清成空对象，**不删任何笔记**——下次同步会重新全量扫描，但因为笔记已存在且 `state` 为空，会**再生成一遍**（`writeNoteFile` 走 `vault.process` 覆盖同路径）。所以重置的真实语义是「重建笔记内容」，不是「清空重来」。
+「重置同步状态」命令把 `state` 清空、**不删任何笔记**。重置后重同步的语义经第十轮 F1/F2 治理：撞上已存在笔记（台账丢失）时**现场按 ID 定位并回收既有资产**——逐字稿/封面/图片/OCR/分类/帧全部复用、不重复计费 ASR，已有 v3 摘要受 `keepExistingSummary` 保护不被现生成版本覆盖；无摘要的笔记才按当前设置补跑。「重建笔记内容」不再是「全部重写一遍」。
+
+> 本节及 §3.11 早于第七~十二轮的描述以「七之三」增补为准。
 
 ---
 
@@ -362,7 +372,7 @@ ffmpeg -nostdin -y -user_agent <UA> -headers "Referer: …" -rw_timeout 60s
 | 1 | 抖音 Argus 拦非浏览器请求 | 独立进程 + Chromium 持久化页面 + `page.evaluate(fetch)` |
 | 2 | headless 被风控 | 自动换 headed 窗口重试（窗口挪到屏幕外） |
 | 3 | 页面长时间驻留挂死 | 请求前 `evaluate("1+1")` 探活 → 重载 → 重建上下文，三级自愈 |
-| 4 | 两个桥接实例抢端口 | `server.on("error")` 里 `process.exit(0)`，后者静默让位 |
+| 4 | 两个桥接实例抢端口 | 端口错误写 stderr 后 exit(1)；且**先听端口再启浏览器**，第二实例不白启 Chromium（2026-09-27） |
 | 5 | Obsidian 拒绝 `sec-ch-ua` 裸引号 | 直连模式 3 档请求头降级，成功档位记进会话 |
 | 6 | 桥接模式登录态 | 来自浏览器 profile，**不传 Cookie**；插件 Cookie 字段只是前置校验 |
 | 7 | 抖音 CDN 拒云端拉取（转写） | 通道 A 失败 → 本地下载 → 临时 OSS → `oss://` 重提 |
@@ -379,8 +389,62 @@ ffmpeg -nostdin -y -user_agent <UA> -headers "Referer: …" -rw_timeout 60s
 | 18 | 重复下载封面/图片 | `saveImage` 先查存在性，命中即返回，幂等 |
 | 19 | 用户自定义过 .base 视图 | `generateBases` 对已存在文件直接跳过，不覆盖 |
 | 20 | 频繁请求触发风控 | 条间 300ms、页间 600ms、重试间 1s 的固定 sleep |
-| 21 | 进程被杀丢进度 | 每处理完一条立即 `saveState`，最多丢正在处理的一条 |
+| 21 | 进程被杀丢进度 | 每处理完一条立即标脏，每 10 条或 30s flush 一次；同步收尾/异常/reset 强制落盘 |
 | 22 | 旧版扁平格式的 data.json | `data.settings ?? data` 兼容读取 |
+
+---
+
+## 七、2026-09-27 优化轮增补（两批均已实施，明细见 PROJECT_LOG 当日记录）
+
+**第一批（正确性/性能 18 项）**：
+
+- **§3.2 拉起**：`main.spawnBridge` 加 single-flight（进行中 promise 复用）与失败 60s 冷却。
+- **§3.3 分页骨架**：`processedStreak` 恢复**跨页累计**（09-19 重构曾写成按页替换，提前停止永不触发）。
+- **§3.3 配置生效**：`refreshClients()` 同时重建 `DouyinClient`——换 Cookie / 切桥接开关即时生效。
+- **§3.4 步骤 1.5**：`pullAssets` 返回结构化 `{assets, error, errorKind}`（共享 lastError 字段删除，并发下不再串号）；ffmpeg 双输出改**按需**（`wantAudio/wantFrames`）；失败路径清理临时目录、`processItem` 无条件 `cleanup`。
+- **§3.5 ASR**：dashscope / tencent / volcengine / qwen3 各请求点补网络异常 catch（failed 进重试台账），轮询容忍连续 5 次网络失败；siliconflow 上传显式 timeout 120s。
+- **§3.11 摘要写入**：三处「frontmatter + 摘要块」合并为单次 `vault.process`（statusCore 新增 `applySummaryToNote`）；callout 行首 `>` 写入侧转全角 `＞`。
+- **其他**：摘要客户端超时 300s；OCR 复用已入库图片（`media.dataUrlFromFile`）；`saveImage` 存在性前置 + 0 字节残档重下 + 失败回查；进程强杀前 `isNodeProcess()` 验映像；设置页文本输入 600ms 防抖；perf 埋点滤零；`Semaphore` 非法 limit fail-fast。
+
+**第二批（P3 全量 + 桥接 + 工程卫生）**：
+
+- **§3.2 桥接启动**：**先听端口再启浏览器**；EADDRINUSE 写 stderr 后 exit(1)；启动窗口内 `/ping` 为 `ok:true, ready:false`（processManager 与 spawnBridge 的就绪判据同步改为 `ok && ready`）。
+- **§3.2 桥接健壮性**：所有 `page.evaluate` 包超时（apiFetch 60s / 探活 10s / 下载 300s），一条挂死请求不再假死串行队列；请求体按端点设上限（/req、/download 1MB；/form-upload 端点已删除）+ `req.on("error")` + `server.on("clientError")` 兜底；`/download` 补 `.catch`；**Host/Origin 校验**（本机 Host 白名单 + 拒绝一切带 Origin 的请求）阻断本地 CSRF 与 DNS rebinding；插件侧 spawn stdout 改 ignore（Windows 管道同步写防日志风暴冻结）。
+- **§3.2 停止/卸载**：`stop()` 与 `dispose()` 均优雅退出先行、`waitGone` 轮询复核，幸存者才验身份强杀。
+- **§3.8 文本手术**：`calloutRange()` 统一块边界（不吞紧邻的下一个 callout）；OCR 导出幂等；`frontmatterBlock()` 先切片再匹配键值（5 处正文劫持面封堵）；`collectExistingAssets` 单遍扫描；逐字稿引擎尾巴不进摘要源；`pushSummaryRecord` 按 notePath 去重（迁入纯函数层）。
+- **§3.8 路径/文件名**：收藏夹名过 `sanitizeFilename`；`sanitizeFilename` 补 Windows 保留名 / 结尾点空格 / DEL；逐字稿 800 字分段按码点切。
+- **其他**：直连档位每实例试探全套头回升；statusHub 透传真实 kernel + 端口占用探测（E2 可达）；「状态刷新间隔」即时生效（statusHub.restart）；AI 超时重试 1 次；OCR 弹窗展示实际模型名；checkFfmpeg 失败 60s TTL；runFfmpeg 超时强制 settle；frameStepMemo 按通道隔离；默认 `videoSummaryModel` 改带版本号。
+- **工程**：测试入仓 `tests/` + `npm test`（74 用例）；tsconfig 收紧（noImplicitReturns / noFallthroughCasesInSwitch / forceConsistentCasingInFileNames）；历史 bak/log 归档至 `.workbuddy/backup/archive-20260927/`。
+- **明确不改（复核后结论）**：顶层 `likes` 是 Bases 排序字段保留；`normalize()` 标题已取首行；volcengine query 串携带 token 保持现状（未实测通道不动，header 已含凭证）；`noUncheckedIndexedAccess` 撤回（报错面过大）。
+
+---
+
+## 七之补、2026-09-27 第六轮增补（三路独立深审 + 接手收尾，明细见 PROJECT_LOG 第六轮记录）
+
+- **转写预算**：`maxTranscribePerSync` 现同时约束**新条目转写**（原只约束重试队列）——预算耗尽后新条目顺延下次同步（不记失败）。
+- **来源还原**：重试/补跑重建笔记按台账 `source` 还原 frontmatter 来源，点赞/作品不再被改写成「收藏」。
+- **摘要门同源**：自动摘要生成门与拉帧门统一走 `resolveVideoSummaryChannel`——只配专用多模态 Key 的用户摘要真正生效。
+- **补跑自愈**：连续失败 ≥3 次的候选本轮跳过（成功即清除）；`getAwemeDetail` 过串行闸门；`hasSummary` 用整行全等正则。
+- **写入/读取往返加固**：OCR 幂等归一化顺序修正；缩进 `[!` 内容行一并全角化；摘要回填不再捏造 `summary_v: 3`；关键帧复用与「是否出摘要」解耦。
+- **ASR/通道**：dashscope 文件级 NO_SPEECH/INVALID_FILE 判 unavailable（与任务级同口径）；aiConfig 的 dashscopeKey 兜底仅在百炼系基址注入（防 401 陷阱）；帧路径数值排序（≥100 帧不再乱序）。
+
+---
+
+## 七之二、2026-09-27/28 第七~十二轮增补（速览，明细见 PROJECT_LOG 各轮记录）
+
+> 本节概括第七轮（processItem 拆分）至第十二轮（纯度收口）的**架构级**变化；§三各流程小节描述的顺序与职责仍成立，但实现形态以下述为准。
+
+**第七轮 · processItem 拆分**：340 行单函数 → 编排器（~60 行）+ 9 个阶段方法（`collectReusedAssets` / `resolveCover` / `resolveVideoAssets` / `downloadImages` / `recognizeImageTexts` / `transcribeVideo` / `categorizeItem` / `writeItemNote` / `runVideoSummary` / `finalizeProcessed`），行为与计时口径不变（计时闭包提取为 `perf.StageTimer`）。跨阶段共享可变局部变量全部改为阶段产物类型随返回值传递。
+
+**第八轮 · 两项借鉴功能落地**：① **相关笔记互链**（`relatedNotes.ts` 纯函数模块）——`relatedScore`（同分类+2/同作者+1）→ `pickRelatedLinks`（确定性排序，上限 `relatedNotesMax` 默认 8）→ `buildRelatedBlock`（HTML 注释标记包裹的 `## 相关笔记` wikilink 块，阅读视图不可见）→ `applyRelatedToNote`（幂等 upsert，标记外零覆盖）；processItem 阶段 10 `linkRelatedNotes` 本条挂块 + 被链笔记回链；命令 `related-refresh` 全量重建。② **摘要风格预设**——`videoSummaryStyle`：hierarchy（默认= v3 层级笔记体）/ outline / qa，frontmatter 记 `summary_style`，切换风格不触发存量重出。
+
+**第九轮 · 三路深审修复**（3 P1 + 12 P2 + 16 P3，架构级要点）：撞库覆盖保护（台账丢失时 `findNotePath` 现场定位 + 共用资产回收）；`state.transcriptCache`（转写成功但写笔记失败的付费结果暂存，FIFO ≤20，命中直接当 asrOverride）；consumePage 同页重复 id 改 **in-flight Set**（并发启动竞态也防）；补跑帧真实间隔随返回值走 + `reextractFrames` 显式重抽意图；摘要帧数降档 `shouldDropToNextStep`；桥接 403→headed 重试 `waitLaunchSettled`；`assertCookie` 桥接模式跳过；statusHub 直连模式早退 + E1 降噪；引擎路径 spawn stderr 管道 + 60s 慢启动三态探测。
+
+**第十轮 + 复审批 · 故障恢复/对抗测试/资源泄漏**：`keepExistingSummary` 保护已有 v3 摘要不被撞库重生成覆盖；`data.json` 写成功后 ≥10 分钟自动备份 `.bak`（原子 tmp 改名），损坏时抢救；`saveImage` 头部魔数校验 + 写后回读核对；桥接**内存自保**——`/ping` 带 `rss` 字段、空闲 ≥10 分钟导航 about:blank 释堆（`pageParked`，恢复后校验 douyin 域）、RSS ≥800MB 整重建；`reqViaBridge` 显式 180s 超时；临时目录懒清理提前到 onload（`clearTempRoot`）；测试新增 74 条对抗断言（含 processManager 双拉起/强杀身份校验——全仓最危险路径首次有测试）。
+
+**第十一轮 · 配置数据完整性**：新增 `src/settingsSanitize.ts`——`sanitizeNumericSettings` 对 10 个数值字段就地消毒（防手改 data.json 的 NaN 击穿转写预算/重试队列/补跑预算）；`needsBackupRescue` 补半损坏形态抢救；`panelView` /ping 行补 `rss=` 展示；8 个凭据输入框统一 password 打码；桥接 `send` 收口异常兜底。**第十二轮**：同模块内部纯度重构（导出签名不变）+ `pickSettingsSource` 合并来源守卫 + 数组按损坏处理。
+
+**两项大手术仍延后（前置未观测）**：ASR 两阶段流水线（等切回百炼 provider）、桥接 page 池（等观测到 /req 排队）。截至 2026-10-01 复核：`asrProvider` 仍为 `siliconflow_sensevoice`、bridge.log 中 /req 零散无排队——维持延后。
 
 ---
 
@@ -391,8 +455,8 @@ ffmpeg -nostdin -y -user_agent <UA> -headers "Referer: …" -rw_timeout 60s
 | 项 | 说明 | 影响 |
 |---|---|---|
 | 收藏夹模式 + 空白名单 | 会**额外跑一遍扁平扫描**（见 §3.3） | 数据量大时同步明显变慢，但不产生重复笔记 |
-| `UA` 不一致 | `douyinClient`/`bridge` 用 Chrome/130，`media.ts` 用 Chrome/140 | 目前无碍（图片 CDN 只查 Referer），但改 UA 时容易漏一处 |
-| `summary.errors` 双重职责 | 既装错误也装「已生成 N 个 Bases」这类信息 | 会出现在「注意：」提示里，观感像报错 |
+| ~~`UA` 不一致~~ | 已收敛：插件侧三处统一走 `util.DOUYIN_UA`（Chrome/130），桥接侧在 bridge-common 单独维护 | 已关闭（2026-09-27） |
+| ~~`summary.errors` 双重职责~~ | 已拆出 `notices` 字段（Bases 已生成 / 重试延后等提示性信息），Notice 先展示 errors 再退 notices | 已关闭（2026-09-27） |
 | 桥接日志落点 | 写在 `__dirname/bridge.log`，插件拉起的实例就写在**插件目录里** | `.gitignore` 已排除；但 Vault 里会多一个日志文件 |
 | ASR 无签名 | 收藏/喜欢端点目前不强校验 `a_bogus`，一旦强校验整体失效 | 已在注释中写明诊断路径 |
 | 图文 OCR 无断点续传 | 视觉失败即当次放弃，不重试 | 与 ASR 行为不一致，见 §3.7 |
