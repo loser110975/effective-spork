@@ -6,6 +6,7 @@ import { requestUrl, type RequestUrlParam } from "obsidian";
 import { AsrProvider, AsrResult, AsrTranscribeOpts, AudioResolver, DEFAULT_SETTINGS } from "../types";
 import { baseUrlProblem } from "../aiConfig";
 import { nodeRequire } from "../util";
+import { classifyAsrFailureKind } from "./failureKind";
 
 const MODEL = "FunAudioLLM/SenseVoiceSmall";
 /** 小于此值的音频视为空壳产物：远端对不可解码输入只回 500 空 body，上传纯属浪费且会掩盖真因。 */
@@ -29,22 +30,22 @@ export class SiliconflowSenseVoice implements AsrProvider {
   async transcribe(url: string, videoId?: string, opts?: AsrTranscribeOpts): Promise<AsrResult> {
     // 配置缺失 / 无效 → 明确报错（保持既有状态语义 failed：与缺 Key 时一致，进重试队列由人工处理）
     const bad = baseUrlProblem(this.baseUrl, "硅基流动");
-    if (bad) return { status: "failed", transcript: "", error: bad };
+    if (bad) return { status: "failed", transcript: "", error: bad, failureKind: classifyAsrFailureKind(bad) };
     if (!this.key) {
-      return { status: "failed", transcript: "", error: "硅基流动 API Key 未配置（Obsidian 设置 → 抖音同步 → 语音转写）" };
+      return { status: "failed", transcript: "", error: "硅基流动 API Key 未配置（Obsidian 设置 → 抖音同步 → 语音转写）", failureKind: classifyAsrFailureKind("硅基流动 API Key 未配置（Obsidian 设置 → 抖音同步 → 语音转写）") };
     }
     if (!url) return { status: "unavailable", transcript: "", error: "无播放地址" };
     if (!this.resolveAudio) {
-      return { status: "failed", transcript: "", error: "未接入音频解析通道（需要 ffmpeg 抽取音轨）" };
+      return { status: "failed", transcript: "", error: "未接入音频解析通道（需要 ffmpeg 抽取音轨）", failureKind: classifyAsrFailureKind("未接入音频解析通道（需要 ffmpeg 抽取音轨）") };
     }
     let audioPath: string | null = null;
     try {
       audioPath = await this.resolveAudio(url, videoId, opts?.durationSec);
     } catch (e: any) {
-      return { status: "failed", transcript: "", provider: this.name, error: `音频抽取异常：${String(e?.message ?? e).slice(0, 150)}` };
+      return { status: "failed", transcript: "", provider: this.name, error: `音频抽取异常：${String(e?.message ?? e).slice(0, 150)}`, failureKind: classifyAsrFailureKind(`音频抽取异常：${String(e?.message ?? e).slice(0, 150)}`) };
     }
     if (!audioPath) {
-      return { status: "failed", transcript: "", provider: this.name, error: "无法取得音频文件（需本机 ffmpeg 抽取音轨）" };
+      return { status: "failed", transcript: "", provider: this.name, error: "无法取得音频文件（需本机 ffmpeg 抽取音轨）", failureKind: classifyAsrFailureKind("无法取得音频文件（需本机 ffmpeg 抽取音轨）") };
     }
     try {
       const text = await this.uploadTranscribe(audioPath);
@@ -52,7 +53,8 @@ export class SiliconflowSenseVoice implements AsrProvider {
       // 纯音乐 / 无对白：无可转写内容，与百炼通道同语义（移出重试队列，不反复重试）
       return { status: "unavailable", transcript: "", provider: this.name, error: "转写结果为空（可能无对白）" };
     } catch (e: any) {
-      return { status: "failed", transcript: "", provider: this.name, error: String(e?.message ?? e).slice(0, 200) };
+      const msg = String(e?.message ?? e).slice(0, 200);
+      return { status: "failed", transcript: "", provider: this.name, error: msg, failureKind: classifyAsrFailureKind(msg) };
     }
   }
 

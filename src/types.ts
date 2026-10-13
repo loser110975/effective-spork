@@ -71,12 +71,18 @@ export interface SyncItem {
 // （backfillVideos 的终态白名单是 success|unavailable|not_requested）。
 export type AsrStatus = "success" | "failed" | "unavailable";
 
+/** 结构化失败分类（P2-2 收敛）：deterministic = 重试必然复现（不入重试队列）；transient = 瞬时网络类（进重试队列）。 */
+export type AsrFailureKind = "deterministic" | "transient";
+
 export interface AsrResult {
   status: AsrStatus;
   transcript: string;
   segments?: { text: string; beginSec: number; endSec: number }[];
   provider?: string;
   error?: string;
+  /** 失败结构化分类（P2-2）：provider 能明确判定时打标；不确定的留空——
+   *  syncEngine 先读本字段，缺失时回退 DETERMINISTIC_ASR_FAILURE_RE 正则兜底（行为与打标前逐条一致）。 */
+  failureKind?: AsrFailureKind;
 }
 
 export interface AsrProvider {

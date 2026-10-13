@@ -25,6 +25,8 @@ import { clampConcurrency, mapLimit, Semaphore } from "./concurrency";
 import type { ItemSource } from "./types";
 import { detailStageTimings, summarizeStageTimings, StageTimer } from "./perf";
 import { SyncLedger, ASR_RETRY_MAX } from "./syncLedger";
+// P2-2：确定性失败正则迁至 asr/failureKind.ts 供 provider 与引擎共用（正则文本逐字未动，仍为兜底）
+import { DETERMINISTIC_ASR_FAILURE_RE } from "./asr/failureKind";
 
 export interface SyncSummary {
   total: number;
@@ -85,11 +87,9 @@ interface NoteWriteInput {
 }
 
 /**
- * 「确定性失败」特征（2026-09-21 P2）：素材侧 / 条目结构 / 通道配置问题，
- * 重试必然复现同一结果 → 不进重试队列，避免每条白跑一次 ffmpeg + 一次上传。
+ * 「确定性失败」特征正则已随 P2-2 迁至 asr/failureKind.ts（DETERMINISTIC_ASR_FAILURE_RE，
+ * 本文件 import 使用）；结构化分类字段为 AsrResult.failureKind，正则仍为漏标兜底。
  */
-const DETERMINISTIC_ASR_FAILURE_RE =
-  /不含视频轨|无法取得音频文件|未接入音频解析通道|音频抽取异常|无播放地址|空壳|未产出有效音轨|缺少 SiliconFlow API Key/;
 
 // 落盘节流阈值 / ASR 重试退避阶梯（性能治理 P0-2 / P1）已随 P1-1 拆至 syncLedger.ts
 // （FLUSH_EVERY_*、ASR_RETRY_BACKOFF_MS、ASR_RETRY_MAX）。
@@ -1128,13 +1128,17 @@ export class SyncEngine {
         // 已调通接口、确认无可转写内容（纯音乐/无对白）→ 移出队列，不反复重试
         summary.asrFailed++;
         this.clearAsrRetry(item.id);
-      } else {
-        summary.asrFailed++;
-        const kind = audioPullKind && audioPullKind !== "none" ? audioPullKind : mediaErrorKind;
-        if (
-          isDeterministicMediaError(kind) ||
-          (kind === "none" && DETERMINISTIC_ASR_FAILURE_RE.test(asr.error ?? ""))
-        ) {
+        } else {
+          summary.asrFailed++;
+          const kind = audioPullKind && audioPullKind !== "none" ? audioPullKind : mediaErrorKind;
+          // P2-2 双轨判定：先读结构化 failureKind（provider 已明确判定的），字段缺失时回退原正则
+          // ——原正则保留为兜底，任何 provider 漏标时判定与改造前完全一致
+          if (
+            isDeterministicMediaError(kind) ||
+            (kind === "none" &&
+              (asr.failureKind === "deterministic" ||
+                (asr.failureKind === undefined && DETERMINISTIC_ASR_FAILURE_RE.test(asr.error ?? ""))))
+          ) {
           // 素材侧失败是确定性的：重试必然复现同一结果，不入队（P2）
           this.clearAsrRetry(item.id);
           summary.errors.push(`转写失败（素材侧，不重试）：${(asr.error ?? "").slice(0, 70)}`);

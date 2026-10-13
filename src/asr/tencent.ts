@@ -2,6 +2,7 @@ import { requestUrl } from "obsidian";
 import { createHash, createHmac } from "crypto";
 import { AsrProvider, AsrResult, DEFAULT_SETTINGS } from "../types";
 import { baseUrlProblem } from "../aiConfig";
+import { classifyAsrFailureKind } from "./failureKind";
 import { sleep } from "../util";
 
 /**
@@ -102,7 +103,7 @@ export class TencentAsr implements AsrProvider {
       });
     } catch (e: any) {
       // 2026-09-27 修：此前提交/轮询的网络异常会冒泡到 processItem 顶层，整条流水线白跑且不进重试台账
-      return { status: "failed", transcript: "", provider: this.name, error: `提交网络异常：${String(e?.message ?? e).slice(0, 150)}` };
+      return { status: "failed", transcript: "", provider: this.name, error: `提交网络异常：${String(e?.message ?? e).slice(0, 150)}`, failureKind: classifyAsrFailureKind(`提交网络异常：${String(e?.message ?? e).slice(0, 150)}`) };
     }
     let createData: any;
     try {
@@ -136,7 +137,7 @@ export class TencentAsr implements AsrProvider {
         });
       } catch {
         // 瞬时网络异常容忍连续多次（任务还在云端跑，不宜整体放弃）
-        if (++netFailures >= 5) return { status: "failed", transcript: "", provider: this.name, error: "轮询网络异常（连续多次请求失败）" };
+        if (++netFailures >= 5) return { status: "failed", transcript: "", provider: this.name, error: "轮询网络异常（连续多次请求失败）", failureKind: "transient" };
         continue;
       }
       netFailures = 0;
@@ -153,7 +154,7 @@ export class TencentAsr implements AsrProvider {
         if (/Throttling|RequestLimitExceeded|InternalError|Unavailable/i.test(String(err.Code ?? "")) && ++serverFailures < 5) {
           continue;
         }
-        return { status: "failed", transcript: "", error: `DescribeTaskStatus: ${err.Code} ${err.Message}` };
+        return { status: "failed", transcript: "", error: `DescribeTaskStatus: ${err.Code} ${err.Message}`, failureKind: classifyAsrFailureKind(`DescribeTaskStatus: ${err.Code} ${err.Message}`) };
       }
       serverFailures = 0;
       const d = data?.Response?.Data;
@@ -169,7 +170,7 @@ export class TencentAsr implements AsrProvider {
         return { status: "success", transcript, segments: segs, provider: this.name };
       }
       if (d?.StatusStr === "failed" || d?.Status === 3) {
-        return { status: "failed", transcript: "", error: `任务失败: ${d?.ErrorMsg ?? ""}（云端可能无法访问抖音 CDN 直链）` };
+        return { status: "failed", transcript: "", error: `任务失败: ${d?.ErrorMsg ?? ""}（云端可能无法访问抖音 CDN 直链）`, failureKind: classifyAsrFailureKind(`任务失败: ${d?.ErrorMsg ?? ""}（云端可能无法访问抖音 CDN 直链）`) };
       }
     }
     return { status: "failed", transcript: "", error: "轮询超时" };

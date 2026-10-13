@@ -4,6 +4,7 @@ import { DEFAULT_SETTINGS } from "../types";
 import { sleep } from "../util";
 import { baseUrlProblem } from "../aiConfig";
 import { DouyinClient, downloadVideoBytes } from "../douyinClient";
+import { classifyAsrFailureKind } from "./failureKind";
 
 /**
  * 阿里云百炼 DashScope — Paraformer 录音文件识别（异步任务）。
@@ -74,7 +75,8 @@ export class DashscopeParaformer implements AsrProvider {
       delete first.serverError;
       return first;
     } catch (e: any) {
-      return { status: "failed", transcript: "", provider: this.name, error: `转写请求异常：${String(e?.message ?? e).slice(0, 200)}` };
+      const msg = `转写请求异常：${String(e?.message ?? e).slice(0, 200)}`;
+      return { status: "failed", transcript: "", provider: this.name, error: msg, failureKind: classifyAsrFailureKind(msg) };
     }
   }
 
@@ -98,10 +100,10 @@ export class DashscopeParaformer implements AsrProvider {
       // 非"云端拉不到"类错误：SERVER_ERROR / 额度耗尽 走跨模型兜底，其余原样返回
       if (!NEED_FALLBACK_RE.test(direct.error ?? "")) {
         const err = direct.error ?? "";
-        return { status: "failed", transcript: "", error: err, serverError: SERVER_ERROR_RE.test(err) || QUOTA_RE.test(err) };
+        return { status: "failed", transcript: "", error: err, failureKind: classifyAsrFailureKind(err), serverError: SERVER_ERROR_RE.test(err) || QUOTA_RE.test(err) };
       }
       if (!videoId) {
-        return { status: "failed", transcript: "", error: `${direct.error}（无 videoId，无法走上传通道）` };
+        return { status: "failed", transcript: "", error: `${direct.error}（无 videoId，无法走上传通道）`, failureKind: classifyAsrFailureKind(`${direct.error}（无 videoId，无法走上传通道）`) };
       }
     }
 
@@ -115,11 +117,12 @@ export class DashscopeParaformer implements AsrProvider {
         const err = retry.error ?? "";
         return retry.permanent
           ? { status: "unavailable", transcript: "", provider: model, error: err }
-          : { status: "failed", transcript: "", error: err, serverError: SERVER_ERROR_RE.test(err) || QUOTA_RE.test(err) };
+          : { status: "failed", transcript: "", error: err, failureKind: classifyAsrFailureKind(err), serverError: SERVER_ERROR_RE.test(err) || QUOTA_RE.test(err) };
       }
       return await this.collectResult(retry.taskId!, model);
     } catch (e: any) {
-      return { status: "failed", transcript: "", error: `上传通道失败: ${String(e?.message ?? e).slice(0, 200)}` };
+      const msg = `上传通道失败: ${String(e?.message ?? e).slice(0, 200)}`;
+      return { status: "failed", transcript: "", error: msg, failureKind: classifyAsrFailureKind(msg) };
     }
   }
 
@@ -222,7 +225,7 @@ export class DashscopeParaformer implements AsrProvider {
         throw: false,
       });
     } catch (e: any) {
-      return { status: "failed", transcript: "", error: `结果拉取网络异常：${String(e?.message ?? e).slice(0, 150)}` };
+      return { status: "failed", transcript: "", error: `结果拉取网络异常：${String(e?.message ?? e).slice(0, 150)}`, failureKind: classifyAsrFailureKind(`结果拉取网络异常：${String(e?.message ?? e).slice(0, 150)}`) };
     }
     let taskData: any;
     try {
@@ -247,13 +250,14 @@ export class DashscopeParaformer implements AsrProvider {
         status: "failed",
         transcript: "",
         error: detail ? `文件级失败 ${detail.slice(0, 200)}` : "结果缺 transcription_url",
+        failureKind: classifyAsrFailureKind(detail),
       };
     }
     let tr: any;
     try {
       tr = await requestUrl({ url: result.transcription_url, method: "GET", throw: false });
     } catch (e: any) {
-      return { status: "failed", transcript: "", error: `转写结果下载网络异常：${String(e?.message ?? e).slice(0, 150)}` };
+      return { status: "failed", transcript: "", error: `转写结果下载网络异常：${String(e?.message ?? e).slice(0, 150)}`, failureKind: classifyAsrFailureKind(`转写结果下载网络异常：${String(e?.message ?? e).slice(0, 150)}`) };
     }
     let trData: any;
     try {
@@ -395,7 +399,8 @@ export class DashscopeQwen3Asr implements AsrProvider {
         timeout: 300_000,
       } as any);
     } catch (e: any) {
-      return { status: "failed", transcript: "", error: `转写请求网络异常：${String(e?.message ?? e).slice(0, 150)}` };
+      const msg = `转写请求网络异常：${String(e?.message ?? e).slice(0, 150)}`;
+      return { status: "failed", transcript: "", error: msg, failureKind: classifyAsrFailureKind(msg) };
     }
     let data: any;
     try {

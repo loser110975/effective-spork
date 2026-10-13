@@ -1,6 +1,7 @@
 import { requestUrl } from "obsidian";
 import { AsrProvider, AsrResult, DEFAULT_SETTINGS } from "../types";
 import { baseUrlProblem } from "../aiConfig";
+import { classifyAsrFailureKind } from "./failureKind";
 import { sleep, randomHex } from "../util";
 
 /**
@@ -56,7 +57,7 @@ export class VolcengineAsr implements AsrProvider {
       });
     } catch (e: any) {
       // 2026-09-27 修：此前提交/轮询的网络异常会冒泡到 processItem 顶层，整条流水线白跑且不进重试台账
-      return { status: "failed", transcript: "", provider: this.name, error: `提交网络异常：${String(e?.message ?? e).slice(0, 150)}` };
+      return { status: "failed", transcript: "", provider: this.name, error: `提交网络异常：${String(e?.message ?? e).slice(0, 150)}`, failureKind: classifyAsrFailureKind(`提交网络异常：${String(e?.message ?? e).slice(0, 150)}`) };
     }
     let submitData: any;
     try {
@@ -86,7 +87,7 @@ export class VolcengineAsr implements AsrProvider {
           throw: false,
         });
       } catch {
-        if (++netFailures >= 5) return { status: "failed", transcript: "", provider: this.name, error: "轮询网络异常（连续多次请求失败）" };
+        if (++netFailures >= 5) return { status: "failed", transcript: "", provider: this.name, error: "轮询网络异常（连续多次请求失败）", failureKind: "transient" };
         continue;
       }
       netFailures = 0;
@@ -111,7 +112,7 @@ export class VolcengineAsr implements AsrProvider {
         return { status: "success", transcript, segments, provider: this.name };
       }
       if (status === 4) {
-        return { status: "failed", transcript: "", error: `任务失败: ${data?.resp?.message ?? ""}（云端可能无法访问抖音 CDN 直链）` };
+        return { status: "failed", transcript: "", error: `任务失败: ${data?.resp?.message ?? ""}（云端可能无法访问抖音 CDN 直链）`, failureKind: classifyAsrFailureKind(`任务失败: ${data?.resp?.message ?? ""}（云端可能无法访问抖音 CDN 直链）`) };
       }
     }
     return { status: "failed", transcript: "", error: "轮询超时" };
