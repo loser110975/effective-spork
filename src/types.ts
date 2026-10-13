@@ -231,6 +231,11 @@ export interface SyncState {
    * 原实现只存在内存——下轮按全新条目重新计费。成功即暂存（FIFO ≤20 条），写笔记成功后清除。
    */
   transcriptCache?: Record<string, { transcript: string; provider: string; at: string }>;
+  /**
+   * 强制重抽帧一次性标志（keyframeIntervalSec 不追溯的配套逃生门）：命令面板置位后，
+   * 下一次同步对所有视频忽略已存抽帧间隔、强制重抽，本轮完成后自动清除。
+   */
+  forceFrameResync?: boolean;
 }
 
 // ---------- 设置 ----------

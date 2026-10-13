@@ -130,6 +130,12 @@ export default class DouyinSyncPlugin extends Plugin {
       name: "补跑旧视频笔记（转录+抽帧+摘要）",
       callback: () => void this.backfillVideos(),
     });
+    // 强制重抽帧（keyframeIntervalSec 不追溯的逃生门）：一次性标志，下次同步生效后自动清除
+    this.addCommand({
+      id: "force-frame-resync",
+      name: "抖音同步：重抽全部视频帧（下次同步生效）",
+      callback: () => void this.requestForceFrameResync(),
+    });
     this.addCommand({
       id: "perf-report",
       name: "查看同步性能画像",
@@ -373,6 +379,31 @@ export default class DouyinSyncPlugin extends Plugin {
     if (summary.asrFailed > 0) {
       new Notice(`有 ${summary.asrFailed} 条转写失败，已加入重试队列（下次同步自动续传）`, 8000);
     }
+    // 强制重抽帧（一次性标志）：常规同步只覆盖新增条目，已存视频的强制重抽由补跑通道执行。
+    // 标志在补跑轮收尾自动清除；补跑失败（抛错）时标志保留，下次同步继续。
+    if (this.engine.state.forceFrameResync && !this.engine.running) {
+      new Notice("检测到强制重抽帧标志：开始重抽全部视频帧…", 8000);
+      try {
+        const msg = await this.engine.backfillVideos((t) => this.setStatusBar(t));
+        new Notice(msg, 10000);
+      } catch (e: any) {
+        new Notice(`强制重抽视频帧失败：${String(e?.message ?? e)}`, 8000);
+      }
+    }
+  }
+
+  /** 置位强制重抽帧标志（命令面板入口）：置位 + Notice 确认 + 立即落盘。 */
+  private async requestForceFrameResync(): Promise<void> {
+    if (this.engine.state.forceFrameResync) {
+      new Notice("强制重抽已置位，将在下次同步时生效（完成后自动清除）", 8000);
+      return;
+    }
+    this.engine.state.forceFrameResync = true;
+    await this.saveSettings();
+    new Notice(
+      "已置位强制重抽：下次同步时将忽略已存的抽帧间隔，重新抽取全部视频帧（受转写预算约束，完成后自动清除）",
+      12000,
+    );
   }
 
   setStatusBar(text: string) {

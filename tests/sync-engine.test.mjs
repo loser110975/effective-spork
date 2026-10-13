@@ -668,6 +668,46 @@ export function runTests(m) {
       t("补跑只对候选调详情接口", calls.detail.length === 1 && calls.detail[0] === "940002");
     }
 
+    console.log("— keyframeIntervalSec 不追溯：间隔不一致不再自动重抽（2026-10 行为变更）—");    {
+      const calls = { onStateChange: 0, saveImage: [], pullAssets: [], cleanup: [], detail: [] };
+      const vault = new MiniVault(m.TFile, m.TFolder);
+      const engine = await makeEngine(m, makeSettings(DEFAULT_SETTINGS, { keyframeIntervalSec: 10 }), vault, calls);
+      // 已完成的视频笔记：存的 frame_interval=30 与当前设置 10 不一致 → 新语义下视为完成（不重抽）
+      await vault.create("抖音/收藏/夹/旧间隔 [980002].md", ["---", "type: 视频", "transcript_status: success", "transcript_provider: test", "frame_interval: 30", "summary_v: 3", "---", "", "> [!abstract]- 摘要", "> 完成摘要", "", "> [!quote]- 逐字稿", "> 转录内容"].join("\n"));
+      engine.state.processed["980002"] = { path: "抖音/收藏/夹/旧间隔 [980002].md", syncedAt: "t", folder: "夹" };
+      DouyinClient.prototype.getAwemeDetail = async (id) => { calls.detail.push(id); return rawVideo(id); };
+      const report = await engine.backfillVideos();
+      delete DouyinClient.prototype.getAwemeDetail;
+      t("间隔不一致（存 30 / 设 10）不再触发补抽：跳过 1、不调详情", report.includes("跳过 1") && calls.detail.length === 0);
+      t("不报强制重抽条数（非强制轮）", !report.includes("强制重抽"));
+      t("笔记内容未被重写（复用既有帧）", vault.files.get("抖音/收藏/夹/旧间隔 [980002].md").data.includes("完成摘要"));
+    }
+
+    console.log("— forceFrameResync：强制重抽一次性标志（置位→强制重抽→自动清除→报数）—");    {
+      const calls = { onStateChange: 0, saveImage: [], pullAssets: [], cleanup: [], detail: [] };
+      const vault = new MiniVault(m.TFile, m.TFolder);
+      const engine = await makeEngine(m, makeSettings(DEFAULT_SETTINGS), vault, calls);
+      // framesOk 达标 + 终态转录 + v3 摘要的「已完成」笔记：正常语义下必然跳过
+      await vault.create("抖音/收藏/夹/完成 [980001].md", ["---", "type: 视频", "transcript_status: success", "transcript_provider: test", "frame_interval: 10", "summary_v: 3", "---", "", "> [!abstract]- 摘要", "> 完成摘要", "", "> [!quote]- 逐字稿", "> 转录内容"].join("\n"));
+      engine.state.processed["980001"] = { path: "抖音/收藏/夹/完成 [980001].md", syncedAt: "t", folder: "夹" };
+      engine.state.forceFrameResync = true;
+      const captured = [];
+      engine.processItem = async (...args) => { captured.push(args); return true; };
+      DouyinClient.prototype.getAwemeDetail = async (id) => { calls.detail.push(id); return rawVideo(id); };
+      const report = await engine.backfillVideos();
+      delete DouyinClient.prototype.getAwemeDetail;
+      t("置位后 framesOk 达标的笔记也进候选集", captured.length === 1 && captured[0][0].id === "980001");
+      t("强制重抽意图：reextract=true（第 8 参）", captured[0][7] === true);
+      t("强制重抽不传 frameHint（禁复用既有帧）", captured[0][6] === undefined);
+      t("本轮完成后标志自动清除", engine.state.forceFrameResync === false);
+      t("报告含强制重抽条数", report.includes("强制重抽 1 条"));
+      // 标志清除后：恢复新语义，达标笔记回到跳过
+      DouyinClient.prototype.getAwemeDetail = async (id) => { calls.detail.push(id); return rawVideo(id); };
+      const report2 = await engine.backfillVideos();
+      delete DouyinClient.prototype.getAwemeDetail;
+      t("标志清除后恢复新语义：达标笔记回到跳过（不重复强制）", calls.detail.length === 1 && report2.includes("跳过 1") && !report2.includes("强制重抽"));
+    }
+
     console.log("— pullAssets 缓存按需维度（复审 P1 回归保护）—");
     {
       const vault = new MiniVault(m.TFile, m.TFolder);

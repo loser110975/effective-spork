@@ -38,6 +38,8 @@ export interface SyncSummary {
   asrSkipped: number;
   visionOk: number;
   videoSummaries: number;
+  /** 强制重抽帧条数（forceFrameResync 置位轮）：本轮按强制意图重抽的视频数 */
+  forcedFrameResync: number;
   errors: string[];
   /** 提示性信息（2026-09-27 自 errors 拆出）：Bases 已生成 / 重试延后等，观感不像报错 */
   notices: string[];
@@ -107,6 +109,7 @@ function newSyncSummary(): SyncSummary {
     asrSkipped: 0,
     visionOk: 0,
     videoSummaries: 0,
+    forcedFrameResync: 0,
     errors: [],
     notices: [],
     startedAt: "",
@@ -933,8 +936,8 @@ export class SyncEngine {
     let mediaPullError = "";
     let frameIntervalSec = 0;
     if (item.type === "video") {
-      // 帧复用与「本次帧的真实间隔」（第九轮 A1/B7 重构）：
-      // - backfill 的 frameHint 只在帧网格达标（storedInterval === wantInterval）时传入 → 直接复用；
+      // 帧复用与「本次帧的真实间隔」（第九轮 A1/B7 重构；间隔语义 2026-10 改为不追溯）：
+      // - backfill 的 frameHint 在帧网格已存在时传入 → 直接复用，回写保持笔记记录的原间隔；
       // - reused 帧回退：仅当没有重抽意图（reextractFrames=false），或本次没有任何拉取方
       //   （needAudio/needFrames 全 false——回退只为保住笔记里已有的帧块）；
       //   原实现 reused 帧无条件劫持，backfill 的重抽意图被吞掉且 frame_interval 被盖章成
@@ -946,11 +949,10 @@ export class SyncEngine {
         : reuseOk && reused?.framePaths.length
           ? reused.framePaths
           : undefined;
-      // 真实间隔：backfill 的 frameHint 保证与当前设置一致；reused 帧以笔记 frontmatter 记录为准
-      //（旧笔记缺记录时按当前设置收编，避免每轮都重进候选集）
-      const hintInterval = hintFromBackfill
-        ? wantInterval
-        : parseInt(reused?.frameInterval ?? "", 10) || wantInterval;
+      // 真实间隔：复用帧一律以笔记记录的既有间隔为准（keyframeIntervalSec 不追溯，2026-10 行为变更）：
+      // 存的 frame_interval 与当前设置不一致时不再自动重抽，复用既有帧并原样回写记录值；
+      // 仅全新抽帧（走拉取分支产出新帧）才用当前设置值。旧笔记缺记录时按当前设置收编。
+      const hintInterval = parseInt(reused?.frameInterval ?? "", 10) || wantInterval;
       if (hint && hint.length > 0 && !needAudio) {
         assets = { audioPath: "", framePaths: hint };
         frameIntervalSec = hintInterval;
@@ -1712,7 +1714,9 @@ export class SyncEngine {
       // 的候选（摘要/帧工作，零 ASR 计费），上限 50 条防一次点击跑完全库。
       const budget = Math.max(0, this.settings.maxTranscribePerSync);
       const REUSE_ONLY_CAP = 50;
-    const wantInterval = Math.max(1, Math.min(60, this.settings.keyframeIntervalSec || 10));
+    // 强制重抽一次性标志（keyframeIntervalSec 不追溯的逃生门）：本轮候选筛选忽略已存间隔，
+    // 全部视频强制重抽；本轮完成后自动清除（异常中断不清，留给下轮继续）。
+    const forceResync = this.state.forceFrameResync === true;
     let done = 0;
     let skipped = 0;
     let failed = 0;
@@ -1759,16 +1763,17 @@ export class SyncEngine {
       // 所有权判定与 statusCore 整行全等口径一致（第六轮）：裸 includes 会被用户自建的
       // 同名 callout 或正文引用行误命中，让缺摘要的笔记被判定「已有摘要」跳过补跑
       const hasSummary = /^> \[!abstract\]- 摘要\s*$/m.test(content);
-      // 抽帧按间隔自适应：间隔设置变过、或从未抽出帧（纯音乐/拉取失败）→ 重抽；
-      // ingestFrames 会清掉旧网格多余帧。摘要按 summary_v 版本号判断（v3 = 层级笔记体），格式升级会重出。
-      // 无帧笔记：若已按当前间隔尝试过抽帧（storedInterval>0）仍无帧（纯音乐/音频流/直链失效），
-      // 视为已完成，避免每次补跑都重复拉视频+重出摘要。
+      // 抽帧不追溯（keyframeIntervalSec 行为变更，用户已批准）：存的 frame_interval 与当前
+      // 设置不一致不再触发自动重抽——帧网格存在、或已按某个间隔尝试过（storedInterval>0）
+      // 即视为完成，复用时回写保持原值。只有从未抽过帧（无帧文件且无 frame_interval 记录）
+      // 才按当前设置补抽；全量强制重抽走命令面板的 forceFrameResync 一次性标志。
+      // 摘要按 summary_v 版本号判断（v3 = 层级笔记体），格式升级会重出。
       const framePaths = listVideoFramePaths(this.app.vault, this.settings.mediaFolder, id);
       const storedInterval = parseInt((fm.match(/^frame_interval:\s*(\d+)\s*$/m) ?? [])[1] ?? "0", 10) || 0;
-      const framesOk =
-        (framePaths.length > 0 || storedInterval > 0) && storedInterval === wantInterval;
+      const framesOk = framePaths.length > 0 || storedInterval > 0;
       const summaryV3 = /^summary_v:\s*3\s*$/m.test(fm);
-      if (transcriptTerminal && hasSummary && framesOk && summaryV3) {
+      // 强制重抽轮（forceFrameResync）：跳过判定整体失效，所有视频笔记都进候选集
+      if (!forceResync && transcriptTerminal && hasSummary && framesOk && summaryV3) {
         skipped++;
         continue;
       }
@@ -1783,7 +1788,8 @@ export class SyncEngine {
           asrOverride = { status: "success", transcript, provider: providerName || "reused" };
         }
       }
-      const frameHint = framesOk && this.settings.videoSummaryEnabled ? framePaths : undefined;
+      // 强制重抽轮不传 frameHint：必须走全片重新拉取 + 按当前设置重抽
+      const frameHint = !forceResync && framesOk && this.settings.videoSummaryEnabled ? framePaths : undefined;
       // 预算 0（禁用转写）时只保留「可复用已有转录」的免费候选（第九轮 A11）
       if (budget <= 0) {
         if (!asrOverride) continue;
@@ -1796,7 +1802,7 @@ export class SyncEngine {
         source: entry.source,
         asrOverride,
         frameHint,
-        reextract: !framesOk,
+        reextract: forceResync || !framesOk,
       });
     }
 
@@ -1850,8 +1856,16 @@ export class SyncEngine {
         }
       }
     }
+    // 强制重抽轮收尾：本轮（候选集确定、任务全部派发）即视为完成 → 自动清除标志并报数。
+    // 候选集受 maxTranscribePerSync 预算与 REUSE_ONLY_CAP 约束时，报数=实际派发的强制条数，
+    // 未跑完的条目下轮补跑仍按新语义处理（帧间隔已不追溯，不会自动重抽）。
+    if (forceResync) {
+      summary.forcedFrameResync = jobs.length;
+      this.state.forceFrameResync = false;
+    }
     await this.saveState();
     const parts = [`补跑完成：处理 ${done}，跳过 ${skipped}，失败 ${failed}`];
+    if (forceResync) parts.push(`强制重抽 ${summary.forcedFrameResync} 条`);
     if (summary.errors.length) parts.push(`注意：${summary.errors[0]}`);
     return parts.join("。");
     } finally {
