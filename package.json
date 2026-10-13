@@ -7,7 +7,8 @@
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "typecheck": "tsc -noEmit -skipLibCheck",
-    "test": "node tests/run-tests.mjs"
+    "test": "node tests/run-tests.mjs",
+    "deploy-bridge": "node scripts/deploy-bridge.mjs"
   },
   "keywords": [],
   "author": "A-Zhou",
