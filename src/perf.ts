@@ -36,6 +36,28 @@ const STAGE_LABELS: { key: NumericKey; label: string }[] = [
   { key: "reuseMs", label: "资产回收" },
 ];
 
+/**
+ * 阶段计时器（性能埋点 P2-15 的写入侧）：管线每进入下一阶段前调 cut(key)，
+ * 把上一阶段的净耗时累计进 perf 记录（同名键可累加）。2026-09-27 第七轮自
+ * processItem 提取为独立类型——计时键与切分点保持拆分前逐位一致，metrics 口径不变。
+ */
+export class StageTimer {
+  private readonly startedAt = Date.now();
+  private stageStart = this.startedAt;
+  readonly perf: Record<string, number> = {};
+
+  cut(key: string): void {
+    const now = Date.now();
+    this.perf[key] = (this.perf[key] ?? 0) + (now - this.stageStart);
+    this.stageStart = now;
+  }
+
+  /** 自计时起点至今的总耗时（管线收尾时调用，等价拆分前的 `Date.now() - perfT0`）。 */
+  totalMs(): number {
+    return Date.now() - this.startedAt;
+  }
+}
+
 /** 线性插值分位数（输入不必有序，内部排序）。空数组返回 0。 */
 export function percentile(values: number[], p: number): number {
   const arr = values.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
@@ -60,11 +82,13 @@ function sec(ms: number): string {
 export function summarizeStageTimings(rows: StageTimings[]): string {
   if (!rows.length) return "";
   const valuesOf = (key: NumericKey) => rows.map((r) => Number(r[key]) || 0);
+  // 阶段维度只统计真正执行过的样本：图文条目的 asrMs/summaryMs 恒为 0，混入会把 p50 大幅拉低、口径失真
+  const stageValues = (key: NumericKey) => valuesOf(key).filter((v) => v > 0);
 
   const totalP50 = percentile(valuesOf("totalMs"), 0.5);
   const totalP90 = percentile(valuesOf("totalMs"), 0.9);
 
-  const stages = STAGE_LABELS.map((s) => ({ label: s.label, p50: percentile(valuesOf(s.key), 0.5) }))
+  const stages = STAGE_LABELS.map((s) => ({ label: s.label, p50: percentile(stageValues(s.key), 0.5) }))
     .filter((s) => s.p50 >= 200)
     .sort((a, b) => b.p50 - a.p50)
     .slice(0, 4)
@@ -81,10 +105,11 @@ export function summarizeStageTimings(rows: StageTimings[]): string {
 export function detailStageTimings(rows: StageTimings[]): string {
   if (!rows.length) return "暂无性能样本（先跑一次同步）";
   const valuesOf = (key: NumericKey) => rows.map((r) => Number(r[key]) || 0);
+  const stageValues = (key: NumericKey) => valuesOf(key).filter((v) => v > 0); // 同上：阶段维度剔除未执行的 0 样本
   const lines = [`样本 ${rows.length} 条`, ""];
   const all: { key: NumericKey; label: string }[] = [{ key: "totalMs", label: "单条合计" }, ...STAGE_LABELS];
   for (const s of all) {
-    const v = valuesOf(s.key);
+    const v = s.key === "totalMs" ? valuesOf(s.key) : stageValues(s.key);
     const p50 = percentile(v, 0.5);
     if (s.key !== "totalMs" && p50 < 50) continue; // 明细里也略过 50ms 以下的噪声
     lines.push(`${s.label}：p50 ${sec(p50)}s / p90 ${sec(percentile(v, 0.9))}s`);

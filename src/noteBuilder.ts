@@ -1,5 +1,5 @@
 import { SyncItem, SOURCE_LABEL, AsrResult } from "./types";
-import { isoFromUnix, localDate, mmss, yamlStr, fmtDuration } from "./util";
+import { isoFromUnix, localDate, mmss, yamlStr, fmtDuration, sanitizeFilename } from "./util";
 
 export interface NoteContentInput {
   item: SyncItem;
@@ -22,7 +22,8 @@ export function planNotePath(
 ): string {
   const parts = [root];
   if (item.source === "collection") {
-    parts.push("收藏", folder || "未分类");
+    // 收藏夹名来自抖音 API，直接进文件系统路径（2026-09-27 修）：含 /\:*?" 等字符会让整条收藏夹同步报错
+    parts.push("收藏", sanitizeFilename(folder, 40) || "未分类");
   } else {
     parts.push(SOURCE_LABEL[item.source]);
   }
@@ -34,7 +35,10 @@ export function planNotePath(
 
 function callout(lines: string[], type = "quote", title = "逐字稿", fold = true): string {
   const head = `> [!${type}]${fold ? "-" : "+"} ${title}`;
-  const body = lines.map((l) => `> ${l.replace(/^>+\s*/, "＞ ")}`);
+  // 行首 `[!` 全角化（2026-09-27 第四轮）：转录/OCR 文本行以 `[!` 开头时，写入会成为
+  // 折叠块内嵌 callout 头，读取侧据此提前断块（重建时尾部内容丢失），与 statusCore 同策略。
+  // 带缩进的变体同样要转（第六轮），判据口径见 statusCore.calloutLine
+  const body = lines.map((l) => `> ${l.replace(/^>+\s*/, "＞ ").replace(/^(\s*)\[!/, "$1[！")}`);
   return [head, ...body].join("\n");
 }
 
@@ -103,7 +107,8 @@ export function buildNote(input: NoteContentInput): string {
   if (item.type === "note" && visionTexts.length > 0) {
     const lines: string[] = [];
     for (const v of visionTexts) {
-      lines.push(`**图 ${v.index}**（${v.status}）`);
+      // status 含换行时单行正则失配（错误信息可能多行）：压成一行（2026-09-27 第四轮）
+      lines.push(`**图 ${v.index}**（${String(v.status).replace(/\r?\n/g, " ")}）`);
       lines.push("");
       lines.push(v.text || "（无文字）");
       lines.push("");
@@ -117,12 +122,19 @@ export function buildNote(input: NoteContentInput): string {
       const lines: string[] = [];
       if (asr.segments && asr.segments.length > 0) {
         for (const seg of asr.segments) {
-          lines.push(`\`${mmss(seg.beginSec)}\` ${seg.text}`);
+          // 段内换行同样要拆行（复审 P2）：裸行无 `>` 前缀会让 extractCallout 提前断块，
+          // 重试重建经 asrOverride 复用时该行之后的逐字稿全部丢失
+          const segLines = String(seg.text ?? "").split(/\r?\n/);
+          lines.push(`\`${mmss(seg.beginSec)}\` ${segLines[0]}`);
+          for (let k = 1; k < segLines.length; k++) lines.push(segLines[k]);
         }
       } else {
-        // 长文本按 800 字切段落，避免 callout 单行过长
-        for (let i = 0; i < asr.transcript.length; i += 800) {
-          lines.push(asr.transcript.slice(i, i + 800));
+        // 长文本按 800 字切段落，避免 callout 单行过长；
+        // 2026-09-27：按码点切（Array.from）——原 slice 按 UTF-16 code unit 会把 emoji 代理对劈成乱码；
+        // 切完再按换行拆行——转录文本内嵌的换行若留在同一物理行里，行首 `>` 会逃过 callout 的转义
+        const chars = Array.from(asr.transcript);
+        for (let i = 0; i < chars.length; i += 800) {
+          lines.push(...chars.slice(i, i + 800).join("").split(/\r?\n/));
         }
       }
       fm.push(callout(lines, "quote", `逐字稿（${asr.provider ?? "ASR"}）`, true), "");

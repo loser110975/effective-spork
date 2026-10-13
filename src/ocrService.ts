@@ -5,6 +5,7 @@ import { App, Modal, Notice, TFile } from "obsidian";
 import type { DouyinSyncSettings, VisionRecord } from "./types";
 import { appendOcrToNoteCallout, imageMimeFromName } from "./statusCore";
 import { AiClient } from "./ai";
+import { resolveOcrPanelChannel } from "./aiConfig";
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 大小上限（超出直接拒绝，不发起模型调用）
 
@@ -29,7 +30,11 @@ export interface OcrOutcome {
   ok: boolean;
   text: string;
   channel: "primary" | "fallback";
+  /** 实际使用的模型名（展示用：付费确认弹窗与结果框不再硬编码模型名） */
+  modelUsed?: string;
   errorCode?: string;
+  /** 具体失败原因（如 Base URL / API Key 未配置），供界面直接展示 */
+  error?: string;
   elapsedMs: number;
   imagePath: string;
   declinedFallback?: boolean;
@@ -62,18 +67,19 @@ export async function readImageAsDataUrl(file: File): Promise<{ dataUrl?: string
 }
 
 /** 调用一次视觉模型（OpenAI 兼容）。channel 决定用 Agnes 主通道还是兜底通道。 */
-async function callVision(s: DouyinSyncSettings, channel: "primary" | "fallback", dataUrl: string, hint: string): Promise<{ ok: boolean; text?: string; errorCode?: string }> {
-  const baseUrl = channel === "primary" ? s.ocrBaseUrl || s.aiBaseUrl : s.aiBaseUrl;
-  const key = (channel === "primary" ? s.ocrApiKey || s.aiKey : s.aiKey).trim();
+async function callVision(s: DouyinSyncSettings, channel: "primary" | "fallback", dataUrl: string, hint: string): Promise<{ ok: boolean; text?: string; errorCode?: string; error?: string }> {
+  // 统一接入：Base URL + API Key 由 aiConfig 从 settings 解析（含 Agnes 主通道 → AI Key 回退链）
+  const chan = resolveOcrPanelChannel(s, channel);
   const model = channel === "primary" ? s.ocrModelPrimary : s.ocrModelFallback;
-  if (!key) return { ok: false, errorCode: "201001" };
-  const client = new AiClient(baseUrl, key, model, model);
+  // 配置缺失 / 无效：明确给出原因（保持 201001 错误码语义不变）
+  if (chan.problem) return { ok: false, errorCode: "201001", error: chan.problem };
+  const client = new AiClient(chan.baseUrl, chan.apiKey, model, model);
   try {
     const text = await client.ocrImage(dataUrl, hint);
     return { ok: true, text };
   } catch (e: any) {
     const m = String(e?.message ?? e);
-    return { ok: false, errorCode: /429|rate|限流/i.test(m) ? "201002" : "201001" };
+    return { ok: false, errorCode: /429|rate|限流/i.test(m) ? "201002" : "201001", error: m.slice(0, 200) };
   }
 }
 
@@ -82,50 +88,58 @@ export async function ocrWithFallback(s: DouyinSyncSettings, dataUrl: string, im
   const started = Date.now();
   const primary = await callVision(s, "primary", dataUrl, hint);
   if (primary.ok) {
-    return { ok: true, text: primary.text ?? "", channel: "primary", elapsedMs: Date.now() - started, imagePath };
+    return { ok: true, text: primary.text ?? "", channel: "primary", modelUsed: s.ocrModelPrimary, elapsedMs: Date.now() - started, imagePath };
   }
   if (!s.ocrFallbackEnabled) {
-    return { ok: false, text: "", channel: "primary", errorCode: primary.errorCode, elapsedMs: Date.now() - started, imagePath };
+    return { ok: false, text: "", channel: "primary", modelUsed: s.ocrModelPrimary, errorCode: primary.errorCode, error: primary.error, elapsedMs: Date.now() - started, imagePath };
   }
-  const approved = await confirmFallback();
+  const approved = await confirmFallback(s);
   if (!approved) {
     // 取消路径：不发起任何付费调用（UserStory §5.2.6 新增 AC）
-    return { ok: false, text: "", channel: "primary", errorCode: primary.errorCode, elapsedMs: Date.now() - started, imagePath, declinedFallback: true };
+    return { ok: false, text: "", channel: "primary", modelUsed: s.ocrModelPrimary, errorCode: primary.errorCode, error: primary.error, elapsedMs: Date.now() - started, imagePath, declinedFallback: true };
   }
   const fb = await callVision(s, "fallback", dataUrl, hint);
   if (fb.ok) {
-    return { ok: true, text: fb.text ?? "", channel: "fallback", elapsedMs: Date.now() - started, imagePath };
+    return { ok: true, text: fb.text ?? "", channel: "fallback", modelUsed: s.ocrModelFallback, elapsedMs: Date.now() - started, imagePath };
   }
   return {
     ok: false,
     text: "",
     channel: "fallback",
+    modelUsed: s.ocrModelFallback,
     errorCode: fb.errorCode ?? primary.errorCode,
+    error: fb.error ?? primary.error,
     elapsedMs: Date.now() - started,
     imagePath,
   };
 }
 
-function confirmFallback(): Promise<boolean> {
+/** 付费兜底确认弹窗：计费对象用实际配置的模型与端点（2026-09-27 修：不再硬编码「百炼 qwen3-vl-plus」）。 */
+function confirmFallback(s: DouyinSyncSettings): Promise<boolean> {
+  const chan = resolveOcrPanelChannel(s, "fallback");
+  const target = `${s.ocrModelFallback}（${chan.baseUrl || "未配置端点"}）`;
   return new Promise((resolve) => {
     class ConfirmModal extends Modal {
       onOpen() {
         this.contentEl.createEl("p", { text: "识别失败，是否改用付费通道重试？" });
         this.contentEl.createEl("p", {
           cls: "mod-muted",
-          text: "将调用阿里云百炼 qwen3-vl-plus（按 token 计费）。取消则不发起任何付费调用。",
+          text: `将调用 ${target}（按 token 计费）。取消则不发起任何付费调用。`,
         });
         const row = this.contentEl.createDiv();
         row.style.display = "flex";
         row.style.gap = "8px";
         row.style.justifyContent = "flex-end";
+        // resolve 必须在 close() 之前（2026-09-27 第四轮修）：Modal.close() 会同步触发 onClose，
+        // 原先「先 close 再 resolve(true)」的确认按钮被 onClose 的 resolve(false) 抢先落定——
+        // 用户明确点了「使用付费通道重试」，实际却按取消处理，付费兜底通道形同虚设
         row.createEl("button", { text: "取消" }).onclick = () => {
-          this.close();
           resolve(false);
+          this.close();
         };
         row.createEl("button", { cls: "mod-cta", text: "使用付费通道重试" }).onclick = () => {
-          this.close();
           resolve(true);
+          this.close();
         };
       }
       onClose() {
@@ -154,6 +168,7 @@ export class OcrResultModal extends Modal {
     app: App,
     private text: string,
     private channel: "primary" | "fallback",
+    private modelUsed = "",
   ) {
     super(app);
   }
@@ -161,8 +176,9 @@ export class OcrResultModal extends Modal {
   onOpen(): void {
     this.contentEl.empty();
     this.contentEl.createEl("h4", { text: "图片文字识别结果" });
+    const label = this.modelUsed || (this.channel === "primary" ? "主通道" : "付费兜底");
     this.contentEl.createDiv({ cls: "mod-muted" }).setText(
-      this.channel === "primary" ? "通道：agnes-2.5-flash（主）" : "通道：qwen3-vl-plus（付费兜底，已确认）",
+      this.channel === "primary" ? `通道：${label}（主）` : `通道：${label}（付费兜底，已确认）`,
     );
     const box = this.contentEl.createEl("textarea");
     box.value = this.text;
@@ -182,9 +198,18 @@ export class OcrResultModal extends Modal {
         new Notice("请先打开一篇笔记再导出");
         return;
       }
-      const cur = await this.app.vault.read(f);
-      await this.app.vault.modify(f, appendOcrToNoteCallout(cur, this.text));
-      new Notice("已追加到当前笔记「图片文字」折叠块（原文未改动）");
+      // vault.process 原子写（2026-09-27 第四轮）：原 read→modify 两段写之间，自动同步的
+      // vault.process 写入会被陈旧快照整体覆盖（与摘要写入同类竞态，statusCore 已修过一次）。
+      // 内容包上 `**图 1**（手动导出）` 分段头：collectExistingAssets 只认该头归属图片段落，
+      // 裸文本会被重试重建静默丢弃
+      const wrapped = `**图 1**（手动导出）\n\n${this.text}`;
+      let changed = false;
+      await this.app.vault.process(f, (data) => {
+        const out = appendOcrToNoteCallout(data, wrapped);
+        changed = out !== data;
+        return out;
+      });
+      new Notice(changed ? "已追加到当前笔记「图片文字」折叠块（原文未改动）" : "内容已存在，未重复追加");
       this.close();
     };
   }

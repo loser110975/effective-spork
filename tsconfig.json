@@ -5,14 +5,14 @@
     "inlineSources": true,
     "module": "ESNext",
     "target": "ES2022",
-    "allowJs": true,
-    "noImplicitAny": true,
     "moduleResolution": "node",
     "importHelpers": true,
     "isolatedModules": true,
-    "strictNullChecks": true,
     "strict": true,
     "skipLibCheck": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
     "lib": ["DOM", "ES2022"]
   },
   "include": ["src/**/*.ts"]

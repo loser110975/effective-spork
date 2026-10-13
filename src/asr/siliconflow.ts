@@ -1,11 +1,12 @@
 // asr/siliconflow.ts — 硅基流动 SenseVoice 语音转写（FunAudioLLM/SenseVoiceSmall）。
 // 需要本地音频文件：经 AudioResolver（VideoMediaStore，ffmpeg 抽取）取得 mp3 后
-// multipart 上传到 /v1/audio/transcriptions。响应 {"text": "..."}，无时间戳。
-import { requestUrl } from "obsidian";
-import { AsrProvider, AsrResult, AsrTranscribeOpts, AudioResolver } from "../types";
+// multipart 上传到 <Base URL>/audio/transcriptions。响应 {"text": "..."}，无时间戳。
+// 接入方式：Base URL（settings.siliconflowBaseUrl，默认官方端点）+ API Key（settings.siliconflowKey）。
+import { requestUrl, type RequestUrlParam } from "obsidian";
+import { AsrProvider, AsrResult, AsrTranscribeOpts, AudioResolver, DEFAULT_SETTINGS } from "../types";
+import { baseUrlProblem } from "../aiConfig";
 import { nodeRequire } from "../util";
 
-const ENDPOINT = "https://api.siliconflow.cn/v1/audio/transcriptions";
 const MODEL = "FunAudioLLM/SenseVoiceSmall";
 /** 小于此值的音频视为空壳产物：远端对不可解码输入只回 500 空 body，上传纯属浪费且会掩盖真因。 */
 const MIN_AUDIO_BYTES = 1024;
@@ -14,15 +15,23 @@ const TRANSIENT_NET_RE = /net::ERR_|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|sock
 
 export class SiliconflowSenseVoice implements AsrProvider {
   readonly name = "siliconflow_sensevoice";
+  private readonly baseUrl: string;
 
   constructor(
     private key: string,
     private resolveAudio?: AudioResolver,
-  ) {}
+    baseUrl?: string,
+  ) {
+    // 统一接入：Base URL 由 settings（siliconflowBaseUrl）传入，缺省回退官方端点
+    this.baseUrl = (baseUrl || DEFAULT_SETTINGS.siliconflowBaseUrl).trim();
+  }
 
   async transcribe(url: string, videoId?: string, opts?: AsrTranscribeOpts): Promise<AsrResult> {
+    // 配置缺失 / 无效 → 明确报错（保持既有状态语义 failed：与缺 Key 时一致，进重试队列由人工处理）
+    const bad = baseUrlProblem(this.baseUrl, "硅基流动");
+    if (bad) return { status: "failed", transcript: "", error: bad };
     if (!this.key) {
-      return { status: "failed", transcript: "", error: "缺少 SiliconFlow API Key（设置页 → 语音转写）" };
+      return { status: "failed", transcript: "", error: "硅基流动 API Key 未配置（Obsidian 设置 → 抖音同步 → 语音转写）" };
     }
     if (!url) return { status: "unavailable", transcript: "", error: "无播放地址" };
     if (!this.resolveAudio) {
@@ -112,12 +121,15 @@ export class SiliconflowSenseVoice implements AsrProvider {
   private async post(body: ArrayBuffer, boundary: string): Promise<{ status: number; text: string; json: any } | null> {
     try {
       const res = await requestUrl({
-        url: ENDPOINT,
+        url: `${this.baseUrl}/audio/transcriptions`,
         method: "POST",
         headers: { Authorization: `Bearer ${this.key}`, "Content-Type": `multipart/form-data; boundary=${boundary}` },
         body,
         throw: false,
-      });
+        // 显式超时（2026-09-27 修）：无此参数受 requestUrl 默认 ~30s 摆布，
+        // 10 分钟上限音频 ≈ 4.8MB，慢上行必被掐断；且 abort 报错若不含 net::ERR_* 特征连重传都没有
+        timeout: 120_000,
+      } as RequestUrlParam & { timeout: number });
       let json: any = null;
       try {
         json = res.json;

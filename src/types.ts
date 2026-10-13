@@ -67,7 +67,9 @@ export interface SyncItem {
 
 // ---------- ASR ----------
 
-export type AsrStatus = "success" | "failed" | "unavailable" | "skipped";
+// 「skipped」成员已删除（2026-09-27 第四轮）：全仓库无生产点，留着会误导补跑终态判定
+// （backfillVideos 的终态白名单是 success|unavailable|not_requested）。
+export type AsrStatus = "success" | "failed" | "unavailable";
 
 export interface AsrResult {
   status: AsrStatus;
@@ -103,6 +105,9 @@ export interface ProcessedEntry {
   syncedAt: string;
   folder: string;
   asrStatus?: AsrStatus;
+  /** 条目来源（2026-09-27 第四轮）：重试/补跑重建笔记时还原 frontmatter source，
+   *  不再硬编码 "collection" 把点赞/作品笔记改写成「收藏」。旧台账缺省回退 collection。 */
+  source?: ItemSource;
 }
 
 /** 进程管控状态（M1/M4；新增，见 系统设计 §4.2.3）。停止成功后清空 PID，避免误用旧 PID。 */
@@ -209,6 +214,17 @@ export interface SyncState {
   processManager?: BridgeProcessManagerState; // 新增：进程管控
   vision?: VisionRecord[]; // 新增：OCR 结果，保留最近 200 条
   summary?: SummaryRecord[]; // 新增：摘要结果，保留最近 200 条
+  /**
+   * 补跑连续失败计数（2026-09-27 第四轮）：候选选取按台账插入顺序取前 budget 个，
+   * 队首固定是最早一批——若其中 CDN 已失效的条目每次补跑都占据名额，尾部健康笔记永远轮不到。
+   * 连续失败 ≥3 次的 id 本轮扫描直接跳过；补跑成功即清除。
+   */
+  backfillFails?: Record<string, number>;
+  /**
+   * 转写结果暂存（2026-09-27 第九轮）：ASR 成功但写笔记失败时条目不进台账，已付费的转录
+   * 原实现只存在内存——下轮按全新条目重新计费。成功即暂存（FIFO ≤20 条），写笔记成功后清除。
+   */
+  transcriptCache?: Record<string, { transcript: string; provider: string; at: string }>;
 }
 
 // ---------- 设置 ----------
@@ -220,6 +236,19 @@ export type AsrProviderKind =
   | "dashscope_qwen3"
   | "volcengine"
   | "tencent";
+
+/**
+ * 视频摘要风格预设（2026-09-27 第八轮，借鉴 BiliNote 的多风格思路）：
+ * hierarchy=层级笔记体（现行 v3 结构，默认）；outline=要点速览；qa=问答复习体。
+ * 切换只影响之后新生成的摘要，不自动触发旧笔记批量重出（补跑判定仍只看 summary_v）。
+ */
+export type SummaryStyle = "hierarchy" | "outline" | "qa";
+
+export const SUMMARY_STYLE_LABELS: Record<SummaryStyle, string> = {
+  hierarchy: "层级笔记体（主题+引言+分节+总结）",
+  outline: "要点速览（观点+要点列表+金句）",
+  qa: "问答复习体（Q/A 问答对）",
+};
 
 export interface DouyinSyncSettings {
   // 连接
@@ -244,18 +273,28 @@ export interface DouyinSyncSettings {
   downloadImages: boolean;
   // ASR
   asrProvider: AsrProviderKind;
+  /** 百炼 DashScope 基址（ASR 异步任务 / qwen3 多模态直转）；一般无需修改，走中转代理时才改 */
+  dashscopeBaseUrl: string;
   dashscopeKey: string;
   dashscopeModel: string; // paraformer-v2
+  /** 硅基流动基址（ASR 音频上传端点 = 该基址 + /audio/transcriptions）；一般无需修改 */
+  siliconflowBaseUrl: string;
+  /** 硅基流动 API Key（ASR = FunAudioLLM/SenseVoiceSmall，需本机 ffmpeg 抽取音频） */
+  siliconflowKey: string;
+  /** 火山引擎 ASR 基址；一般无需修改 */
+  volcBaseUrl: string;
   volcAppId: string;
   volcToken: string;
   volcCluster: string;
+  /** 腾讯云 ASR 基址；一般无需修改 */
+  tencentBaseUrl: string;
   tencentSecretId: string;
   tencentSecretKey: string;
-  /** 硅基流动 API Key（ASR = FunAudioLLM/SenseVoiceSmall，需本机 ffmpeg 抽取音频） */
-  siliconflowKey: string;
   /** 视频多模态总结（视频类收藏专用）：转录文字 + 关键帧 → 百炼视觉模型生成结构化摘要（不含照片） */
   videoSummaryEnabled: boolean;
   videoSummaryModel: string;
+  /** 摘要风格预设（写入 frontmatter summary_style；切换不自动重出旧摘要） */
+  videoSummaryStyle: SummaryStyle;
   /** 多模态总结专用通道（留空复用 aiBaseUrl/aiKey）：便于独立接入智谱 GLM 等服务，隔离分类通道 */
   videoSummaryBaseUrl: string;
   videoSummaryApiKey: string;
@@ -271,6 +310,10 @@ export interface DouyinSyncSettings {
   enableCategory: boolean;
   enableVision: boolean;
   visionModel: string;
+  /** 相关笔记互链（第八轮）：同分类/同作者笔记在文末「相关笔记」块互链；0 候选时不留块 */
+  relatedNotesEnabled: boolean;
+  /** 每篇笔记最多互链条数（1~30） */
+  relatedNotesMax: number;
   /** OCR 视觉通道独立基址（留空复用 aiBaseUrl）。用于把 OCR 从过载通道隔离出来 */
   visionBaseUrl: string;
   /** OCR 视觉通道独立 Key（留空复用 aiKey / dashscopeKey） */
@@ -330,16 +373,22 @@ export const DEFAULT_SETTINGS: DouyinSyncSettings = {
   downloadCover: true,
   downloadImages: true,
   asrProvider: "siliconflow_sensevoice",
+  dashscopeBaseUrl: "https://dashscope.aliyuncs.com/api/v1",
   dashscopeKey: "",
   dashscopeModel: "paraformer-v2",
+  siliconflowBaseUrl: "https://api.siliconflow.cn/v1",
+  siliconflowKey: "",
+  volcBaseUrl: "https://openspeech.bytedance.com/api/v1",
   volcAppId: "",
   volcToken: "",
   volcCluster: "volcengine_auc_common",
+  tencentBaseUrl: "https://asr.tencentcloudapi.com",
   tencentSecretId: "",
   tencentSecretKey: "",
-  siliconflowKey: "",
   videoSummaryEnabled: true,
-  videoSummaryModel: "qwen3-vl-plus",
+  // 注意：裸名 qwen3-vl-plus 已不在百炼有额度列表（FreeTierOnly 403），默认用带版本号的模型（2026-09-26 额度报告）
+  videoSummaryModel: "qwen3-vl-plus-2025-12-19",
+  videoSummaryStyle: "hierarchy",
   videoSummaryBaseUrl: "",
   videoSummaryApiKey: "",
   keyframeIntervalSec: 10,
@@ -351,6 +400,8 @@ export const DEFAULT_SETTINGS: DouyinSyncSettings = {
   enableCategory: true,
   enableVision: true,
   visionModel: "qwen-vl-plus",
+  relatedNotesEnabled: true,
+  relatedNotesMax: 8,
   visionBaseUrl: "",
   visionApiKey: "",
   visionConcurrency: 3,
@@ -369,7 +420,8 @@ export const DEFAULT_SETTINGS: DouyinSyncSettings = {
   ocrBaseUrl: "https://api.agnes-ai.cn/v1",
   ocrApiKey: "",
   ocrModelPrimary: "agnes-2.5-flash",
-  ocrModelFallback: "qwen3-vl-plus",
+  // 注意：裸名 qwen3-vl-plus 已不在百炼有额度列表（FreeTierOnly 403），与 videoSummaryModel 同口径（复审 P2）
+  ocrModelFallback: "qwen3-vl-plus-2025-12-19",
   ocrFallbackEnabled: true,
   summaryEnabled: true,
   summaryMaxTokens: 500,

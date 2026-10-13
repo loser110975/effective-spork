@@ -1,19 +1,21 @@
 import { requestUrl } from "obsidian";
 import { AsrProvider, AsrResult } from "../types";
+import { DEFAULT_SETTINGS } from "../types";
 import { sleep } from "../util";
+import { baseUrlProblem } from "../aiConfig";
 import { DouyinClient } from "../douyinClient";
 
 /**
  * 阿里云百炼 DashScope — Paraformer 录音文件识别（异步任务）。
  * 文档：https://help.aliyun.com/zh/model-studio/paraformer-recorded-speech-recognition
  *
+ * 接入方式：Base URL（settings.dashscopeBaseUrl，默认官方端点）+ API Key（settings.dashscopeKey）。
  * 通道 A（默认）：file_urls 直传公网 URL，服务端拉取。
  *   抖音 CDN 会 403 拒绝阿里云数据中心 IP → FILE_403_FORBIDDEN。
  * 通道 B（自动回退）：本地下载视频字节 → 百炼临时 OSS（getPolicy + multipart 上传）
  *   → file_urls 传 oss:// 地址（需 X-DashScope-OssResourceResolve: enable）。
  */
 
-const BASE = "https://dashscope.aliyuncs.com/api/v1";
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
@@ -28,16 +30,23 @@ const NO_SPEECH_RE = /SUCCESS_WITH_NO_VALID_FRAGMENT|ASR_RESPONSE_HAVE_NO_WORDS/
 
 type AsrAttempt = AsrResult & { serverError?: boolean };
 
+/** 单次轮询请求连续网络失败容忍次数：30 分钟窗口内网络抖动概率不低，抖一次就放弃整个任务太浪费。 */
+const POLL_NET_TOLERANCE = 5;
+
 export class DashscopeParaformer implements AsrProvider {
   readonly name = "dashscope_paraformer";
   private readonly fallbackModel: string | null;
+  private readonly baseUrl: string;
 
   constructor(
     private key: string,
     private model: string = "paraformer-v2",
     private pollTimeoutMs: number = 30 * 60 * 1000,
     private client?: DouyinClient | null,
+    baseUrl?: string,
   ) {
+    // 统一接入：Base URL 由 settings（dashscopeBaseUrl）传入，缺省回退官方端点
+    this.baseUrl = (baseUrl || DEFAULT_SETTINGS.dashscopeBaseUrl).trim();
     this.fallbackModel = DashscopeParaformer.pickFallback(model);
   }
 
@@ -49,37 +58,54 @@ export class DashscopeParaformer implements AsrProvider {
   }
 
   async transcribe(url: string, videoId?: string): Promise<AsrResult> {
-    if (!this.key) return { status: "unavailable", transcript: "", error: "缺少 DASHSCOPE_API_KEY" };
+    // 配置缺失 / 无效 → 明确报错（状态语义保持 unavailable：配置问题不进重试队列）
+    const bad = baseUrlProblem(this.baseUrl, "百炼 DashScope");
+    if (bad) return { status: "unavailable", transcript: "", error: bad };
+    if (!this.key) return { status: "unavailable", transcript: "", error: "百炼 DashScope API Key 未配置（Obsidian 设置 → 抖音同步 → 语音转写）" };
     if (!url) return { status: "unavailable", transcript: "", error: "无播放地址" };
 
-    const first = await this.transcribeWithModel(this.model, url, videoId);
-    // 服务端处理错误 / 主模型额度耗尽 且互备模型可用 → 换模型完整重试（直传 + 上传通道）
-    if (first.status === "failed" && first.serverError && this.fallbackModel && this.fallbackModel !== this.model) {
-      const second = await this.transcribeWithModel(this.fallbackModel, url, videoId);
-      delete second.serverError;
-      return second;
+    // 顶层兜底（2026-09-27 修）：此前任何一次 requestUrl 网络异常都会直接冒泡到 processItem 的大 catch
+    // —— 封面/抽帧/OCR 已全部完成，笔记却不写、重试台账也不记，下轮从零重跑整条流水线。
+    try {
+      const first = await this.transcribeWithModel(this.model, url, videoId);
+      // 服务端处理错误 / 主模型额度耗尽 且互备模型可用 → 换模型完整重试（直传 + 上传通道）
+      if (first.status === "failed" && first.serverError && this.fallbackModel && this.fallbackModel !== this.model) {
+        const second = await this.transcribeWithModel(this.fallbackModel, url, videoId);
+        delete second.serverError;
+        return second;
+      }
+      delete first.serverError;
+      return first;
+    } catch (e: any) {
+      return { status: "failed", transcript: "", provider: this.name, error: `转写请求异常：${String(e?.message ?? e).slice(0, 200)}` };
     }
-    delete first.serverError;
-    return first;
   }
 
   private async transcribeWithModel(model: string, url: string, videoId?: string): Promise<AsrAttempt> {
     // ---- 通道 A：URL 直传 ----
     const direct = await this.submitAndPoll([url], model);
-    if (direct.ok) return await this.collectResult(direct.taskId!, model);
-
-    // 永久性失败（纯音乐/无对白等，无可识别语音）——标记 unavailable，不再重试
-    if (direct.permanent) {
-      return { status: "unavailable", transcript: "", provider: model, error: direct.error };
-    }
-
-    // 非"云端拉不到"类错误：SERVER_ERROR / 额度耗尽 走跨模型兜底，其余原样返回
-    if (!NEED_FALLBACK_RE.test(direct.error ?? "")) {
-      const err = direct.error ?? "";
-      return { status: "failed", transcript: "", error: err, serverError: SERVER_ERROR_RE.test(err) || QUOTA_RE.test(err) };
-    }
-    if (!videoId) {
-      return { status: "failed", transcript: "", error: `${direct.error}（无 videoId，无法走上传通道）` };
+    if (direct.ok) {
+      const got = await this.collectResult(direct.taskId!, model);
+      // 任务 SUCCEEDED 但单文件结果失败（2026-09-27 第四轮）：results[0] 带 code/message
+      // （如 FILE_403_FORBIDDEN / FILE_DOWNLOAD_*）而无 transcription_url，是「云端拉取失败」
+      // 的确切形态——与提交阶段同类，通道 B（上传 OSS）同样能救。带不出错误码时
+      // NEED_FALLBACK_RE 无法命中，通道 B 对这类失败永远不会触发。
+      if (!(got.status === "failed" && videoId && NEED_FALLBACK_RE.test(got.error ?? ""))) {
+        return got;
+      }
+    } else {
+      // 永久性失败（纯音乐/无对白等，无可识别语音）——标记 unavailable，不再重试
+      if (direct.permanent) {
+        return { status: "unavailable", transcript: "", provider: model, error: direct.error };
+      }
+      // 非"云端拉不到"类错误：SERVER_ERROR / 额度耗尽 走跨模型兜底，其余原样返回
+      if (!NEED_FALLBACK_RE.test(direct.error ?? "")) {
+        const err = direct.error ?? "";
+        return { status: "failed", transcript: "", error: err, serverError: SERVER_ERROR_RE.test(err) || QUOTA_RE.test(err) };
+      }
+      if (!videoId) {
+        return { status: "failed", transcript: "", error: `${direct.error}（无 videoId，无法走上传通道）` };
+      }
     }
 
     // ---- 通道 B：本地下载 → 临时 OSS → oss:// 提交 ----
@@ -114,18 +140,23 @@ export class DashscopeParaformer implements AsrProvider {
     };
     if (opts?.ossResolve) headers["X-DashScope-OssResourceResolve"] = "enable";
 
-    const submit = await requestUrl({
-      url: `${BASE}/services/audio/asr/transcription`,
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model,
-        input: { file_urls: fileUrls },
-        // paraformer 需显式语种；fun-asr 系支持 31 语种自动检测，不传效果更好
-        ...(model.startsWith("paraformer") ? { parameters: { language_hints: ["zh"] } } : {}),
-      }),
-      throw: false,
-    });
+    let submit: any;
+    try {
+      submit = await requestUrl({
+        url: `${this.baseUrl}/services/audio/asr/transcription`,
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model,
+          input: { file_urls: fileUrls },
+          // paraformer 需显式语种；fun-asr 系支持 31 语种自动检测，不传效果更好
+          ...(model.startsWith("paraformer") ? { parameters: { language_hints: ["zh"] } } : {}),
+        }),
+        throw: false,
+      });
+    } catch (e: any) {
+      return { ok: false, error: `提交网络异常：${String(e?.message ?? e).slice(0, 150)}` };
+    }
     if (submit.status >= 300) {
       return { ok: false, error: `提交失败 HTTP ${submit.status}: ${submit.text.slice(0, 200)}` };
     }
@@ -144,14 +175,25 @@ export class DashscopeParaformer implements AsrProvider {
 
   private async pollTask(taskId: string): Promise<{ ok: boolean; taskId?: string; error?: string; permanent?: boolean }> {
     const deadline = Date.now() + this.pollTimeoutMs;
+    let netFailures = 0;
     while (Date.now() < deadline) {
       await sleep(5000);
-      const poll = await requestUrl({
-        url: `${BASE}/tasks/${taskId}`,
-        method: "GET",
-        headers: { Authorization: `Bearer ${this.key}` },
-        throw: false,
-      });
+      let poll: any;
+      try {
+        poll = await requestUrl({
+          url: `${this.baseUrl}/tasks/${taskId}`,
+          method: "GET",
+          headers: { Authorization: `Bearer ${this.key}` },
+          throw: false,
+        });
+      } catch {
+        // 轮询中的瞬时网络异常：容忍连续 POLL_NET_TOLERANCE 次（任务本身还在云端跑，不宜整体放弃）
+        if (++netFailures >= POLL_NET_TOLERANCE) {
+          return { ok: false, taskId, error: "轮询网络异常（连续多次请求失败）" };
+        }
+        continue;
+      }
+      netFailures = 0;
       let taskData: any;
       try {
         taskData = poll.json;
@@ -174,12 +216,17 @@ export class DashscopeParaformer implements AsrProvider {
   // ---------- 结果解析 ----------
 
   private async collectResult(taskId: string, model?: string): Promise<AsrResult> {
-    const poll = await requestUrl({
-      url: `${BASE}/tasks/${taskId}`,
-      method: "GET",
-      headers: { Authorization: `Bearer ${this.key}` },
-      throw: false,
-    });
+    let poll: any;
+    try {
+      poll = await requestUrl({
+        url: `${this.baseUrl}/tasks/${taskId}`,
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.key}` },
+        throw: false,
+      });
+    } catch (e: any) {
+      return { status: "failed", transcript: "", error: `结果拉取网络异常：${String(e?.message ?? e).slice(0, 150)}` };
+    }
     let taskData: any;
     try {
       taskData = poll.json;
@@ -188,9 +235,29 @@ export class DashscopeParaformer implements AsrProvider {
     }
     const result = taskData.output?.results?.[0];
     if (!result?.transcription_url) {
-      return { status: "failed", transcript: "", error: "结果缺 transcription_url" };
+      // 单文件失败时服务端把 code/message 放在 results[0]（如 FILE_403_FORBIDDEN）：
+      // 原样带回，让 NEED_FALLBACK_RE / 确定性分类正常接管（此前只报通用错误，两套分类全部失明）
+      const code = String(result?.code ?? "");
+      const msg = String(result?.message ?? "");
+      const detail = `${code} ${msg}`.trim();
+      // 文件级失败与任务级同语义归类（第六轮）：纯音乐/无对白（NO_SPEECH）与无效文件
+      // 重试必然复现同一结果，与 pollTask 的 permanent 判定同口径 → unavailable 移出
+      // 重试队列；原实现一律 failed，纯音乐条目被反复重试直至 dead-letter
+      if (detail && (NO_SPEECH_RE.test(detail) || /INVALID_FILE|UNSUPPORTED_FILE|InvalidFile/i.test(detail))) {
+        return { status: "unavailable", transcript: "", error: `文件级失败 ${detail.slice(0, 200)}` };
+      }
+      return {
+        status: "failed",
+        transcript: "",
+        error: detail ? `文件级失败 ${detail.slice(0, 200)}` : "结果缺 transcription_url",
+      };
     }
-    const tr = await requestUrl({ url: result.transcription_url, method: "GET", throw: false });
+    let tr: any;
+    try {
+      tr = await requestUrl({ url: result.transcription_url, method: "GET", throw: false });
+    } catch (e: any) {
+      return { status: "failed", transcript: "", error: `转写结果下载网络异常：${String(e?.message ?? e).slice(0, 150)}` };
+    }
     let trData: any;
     try {
       trData = tr.json;
@@ -215,13 +282,14 @@ export class DashscopeParaformer implements AsrProvider {
   /** 本地下载视频字节。URL 失效时经桥接刷新播放地址重试一次。 */
   private async fetchVideoBytes(url: string, videoId: string): Promise<ArrayBuffer> {
     const headers = { "User-Agent": BROWSER_UA, Referer: "https://www.douyin.com/" };
-    let res = await requestUrl({ url, method: "GET", headers, throw: false });
+    // 显式超时（复审 P2）：上限 200MB 的全片下载受 requestUrl 默认 ~30s 摆布必被掐断，放宽到 10 分钟
+    let res = await requestUrl({ url, method: "GET", headers, throw: false, timeout: 600_000 } as any);
     if (res.status >= 400 && this.client) {
       // 播放地址通常带 expires 签名，过期即 403 —— 经桥接重新拿 detail 刷新
       const raw = await this.client.getAwemeDetail(videoId);
       const fresh = raw ? DouyinClient.normalize(raw as any, "collection") : null;
       if (fresh?.playUrl && fresh.playUrl !== url) {
-        res = await requestUrl({ url: fresh.playUrl, method: "GET", headers, throw: false });
+        res = await requestUrl({ url: fresh.playUrl, method: "GET", headers, throw: false, timeout: 600_000 } as any);
       }
     }
     if (res.status >= 400) {
@@ -239,7 +307,7 @@ export class DashscopeParaformer implements AsrProvider {
 
   private async getUploadPolicy(model?: string) {
     const r = await requestUrl({
-      url: `${BASE}/uploads?action=getPolicy&model=${encodeURIComponent(model ?? this.model)}`,
+      url: `${this.baseUrl}/uploads?action=getPolicy&model=${encodeURIComponent(model ?? this.model)}`,
       method: "GET",
       headers: { Authorization: `Bearer ${this.key}`, "Content-Type": "application/json" },
       throw: false,
@@ -269,32 +337,28 @@ export class DashscopeParaformer implements AsrProvider {
     const ossKey = `${policy.upload_dir}/${filename}`;
     const boundary = "----dsboundary" + Date.now().toString(16);
     const enc = new TextEncoder();
-    const parts: Uint8Array[] = [];
-    const field = (name: string, value: string) => {
-      parts.push(enc.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`));
-    };
-    field("OSSAccessKeyId", policy.oss_access_key_id);
-    field("Signature", policy.signature);
-    field("policy", policy.policy);
-    field("x-oss-object-acl", policy.x_oss_object_acl);
-    field("x-oss-forbid-overwrite", policy.x_oss_forbid_overwrite);
-    field("key", ossKey);
-    field("success_action_status", "200");
-    parts.push(
-      enc.encode(
-        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
-      ),
-    );
-    parts.push(new Uint8Array(videoBuf));
-    parts.push(enc.encode(`\r\n--${boundary}--\r\n`));
-
-    const total = parts.reduce((s, x) => s + x.byteLength, 0);
-    const body = new Uint8Array(total);
-    let off = 0;
-    for (const p of parts) {
-      body.set(p, off);
-      off += p.byteLength;
-    }
+    const field = (name: string, value: string) =>
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`;
+    const headText =
+      field("OSSAccessKeyId", policy.oss_access_key_id) +
+      field("Signature", policy.signature) +
+      field("policy", policy.policy) +
+      field("x-oss-object-acl", policy.x_oss_object_acl) +
+      field("x-oss-forbid-overwrite", policy.x_oss_forbid_overwrite) +
+      field("key", ossKey) +
+      field("success_action_status", "200") +
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: application/octet-stream\r\n\r\n`;
+    const head = enc.encode(headText);
+    const tail = enc.encode(`\r\n--${boundary}--\r\n`);
+    // body 必须整体构建（multipart 无流式接口，requestUrl 只收单个 ArrayBuffer）：
+    // header/tail 两次小拷贝 + 文件字节一次 set。注意 `new Uint8Array(videoBuf)` 只是视图
+    // 不拷贝，但 body 分配与 set 仍是全量拷贝——videoBuf 在调用方仍存活时峰值仍约 2× 文件
+    // 体积（200MB 文件 ≈ 400MB）。真正的峰值减半需要分片流式上传，requestUrl 不支持，维持现状。
+    const fileBytes = new Uint8Array(videoBuf);
+    const body = new Uint8Array(head.byteLength + fileBytes.byteLength + tail.byteLength);
+    body.set(head, 0);
+    body.set(fileBytes, head.byteLength);
+    body.set(tail, head.byteLength + fileBytes.byteLength);
 
     const r = await requestUrl({
       url: policy.upload_host,
@@ -302,7 +366,10 @@ export class DashscopeParaformer implements AsrProvider {
       headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
       body: body.buffer as ArrayBuffer,
       throw: false,
-    });
+      // 显式超时（2026-09-27 第四轮）：requestUrl 默认 ~30s，家宽上行传 100MB+ 必被掐断——
+      // 异常被归为「上传通道失败」可重试类，下轮重新下载 200MB 再传，反复白烧流量直到 dead-letter
+      timeout: 600_000,
+    } as any);
     if (r.status !== 200) {
       throw new Error(`OSS 上传失败 HTTP ${r.status}: ${r.text.slice(0, 200)}`);
     }
@@ -315,30 +382,45 @@ export class DashscopeParaformer implements AsrProvider {
  */
 export class DashscopeQwen3Asr implements AsrProvider {
   readonly name = "dashscope_qwen3";
+  private readonly baseUrl: string;
 
-  constructor(private key: string) {}
+  constructor(private key: string, baseUrl?: string) {
+    // 统一接入：Base URL 由 settings（dashscopeBaseUrl）传入，缺省回退官方端点
+    this.baseUrl = (baseUrl || DEFAULT_SETTINGS.dashscopeBaseUrl).trim();
+  }
 
   async transcribe(url: string): Promise<AsrResult> {
-    if (!this.key) return { status: "unavailable", transcript: "", error: "缺少 DASHSCOPE_API_KEY" };
+    const bad = baseUrlProblem(this.baseUrl, "百炼 DashScope");
+    if (bad) return { status: "unavailable", transcript: "", error: bad };
+    if (!this.key) return { status: "unavailable", transcript: "", error: "百炼 DashScope API Key 未配置（Obsidian 设置 → 抖音同步 → 语音转写）" };
     if (!url) return { status: "unavailable", transcript: "", error: "无播放地址" };
-    const res = await requestUrl({
-      url: "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "qwen3-asr-flash",
-        messages: [
-          { role: "system", content: [{ text: "" }] },
-          { role: "user", content: [{ audio: url }] },
-        ],
-        result_format: "message",
-        asr_options: { enable_lid: true, enable_itn: false },
-      }),
-      throw: false,
-    });
+    let res: any;
+    try {
+      res = await requestUrl({
+        url: `${this.baseUrl}/services/aigc/multimodal-generation/generation`,
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.key}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "qwen3-asr-flash",
+          messages: [
+            { role: "system", content: [{ text: "" }] },
+            { role: "user", content: [{ audio: url }] },
+          ],
+          result_format: "message",
+          asr_options: { enable_lid: true, enable_itn: false },
+        }),
+        throw: false,
+        // 同步推理显式超时（2026-09-27 第四轮）：这是全部 provider 里唯一的同步直转调用，
+        // requestUrl 默认 ~30s 对 600s 音频的服务端直转大概率不够——长视频稳定超时进重试，
+        // 表现为「qwen3 转写永远失败」且极难排查
+        timeout: 300_000,
+      } as any);
+    } catch (e: any) {
+      return { status: "failed", transcript: "", error: `转写请求网络异常：${String(e?.message ?? e).slice(0, 150)}` };
+    }
     let data: any;
     try {
       data = res.json;

@@ -4,6 +4,7 @@ import { ItemView, WorkspaceLeaf } from "obsidian";
 import type { BridgeProcessManagerState, DouyinSyncSettings } from "./types";
 import type { ProcessManager } from "./processManager";
 import { renderStatusBadge, type StatusSnapshot } from "./statusHub";
+import { formatRss } from "./statusCore";
 import type { StatusHub } from "./statusHub";
 
 export const VIEW_TYPE_DOUYIN_PANEL = "douyin-sync-panel";
@@ -92,7 +93,9 @@ export class DouyinSyncPanelView extends ItemView {
       const r = await fn();
       btn.setText(original);
       btn.disabled = false;
-      if (!r.ok) this.inlineEl.setText(r.msg);
+      // 成功时清掉上一次操作残留的错误文案（第九轮 C10）
+      if (r.ok) this.inlineEl.setText("");
+      else this.inlineEl.setText(r.msg);
       await this.host.statusHub.probe();
     } catch (e: any) {
       btn.setText(original);
@@ -109,7 +112,7 @@ export class DouyinSyncPanelView extends ItemView {
       ["进程态", s.processState],
       ["连接态", s.connectionState],
       ["桥接 PID", pm.bridgePid > 0 ? String(pm.bridgePid) : "未知（外部拉起或未运行）"],
-      ["端口", String(this.host.settings.bridgeUrl)],
+      ["桥接地址", String(this.host.settings.bridgeUrl)],
       ["最近启动", pm.lastStartAt ?? "—"],
       ["最近停止", pm.lastStopAt ?? "—"],
     ];
@@ -121,15 +124,24 @@ export class DouyinSyncPanelView extends ItemView {
     void this.refreshPingDetail();
   }
 
+  /** /ping 详情固定复用同一行（复审 P2）：原实现每次 render 后异步追加一行，状态频繁翻转时行数只增不减 */
+  private pingRow: { value: HTMLElement } | null = null;
+  private pingSeq = 0;
+
   private async refreshPingDetail(): Promise<void> {
+    const seq = ++this.pingSeq;
     const d = await this.host.getPingDetail();
-    if (!d) return;
-    const row = this.detailEl.createDiv({ cls: "douyin-sync-row" });
-    row.createSpan({ cls: "douyin-sync-k", text: "/ping" });
-    row.createSpan({
-      cls: "douyin-sync-v",
-      text: `kernel=${d.kernel ?? "—"} ready=${d.ready ?? "—"} headed=${d.headed ?? "—"}`,
-    });
+    if (!d || seq !== this.pingSeq) return; // 期间又 render 过 → 本次结果作废，防并发双写
+    if (!this.pingRow || !this.pingRow.value.isConnected) {
+      const row = this.detailEl.createDiv({ cls: "douyin-sync-row" });
+      row.createSpan({ cls: "douyin-sync-k", text: "/ping" });
+      this.pingRow = { value: row.createSpan({ cls: "douyin-sync-v" }) };
+    }
+    // 第十轮 P2-1 给 /ping 加了 rss 字节（内存自保的观察口），第十一轮补上展示——
+    // 挂机场景下 RSS 持续增长（≥800MB 会整重建）此前只能翻控制台才能看到
+    this.pingRow.value.setText(
+      `kernel=${d.kernel ?? "—"} ready=${d.ready ?? "—"} headed=${d.headed ?? "—"} rss=${formatRss(d.rss)}`,
+    );
   }
 
   async onClose(): Promise<void> {

@@ -13,8 +13,16 @@
 export class Semaphore {
   private active = 0;
   private readonly queue: (() => void)[] = [];
+  private readonly limit: number;
 
-  constructor(private readonly limit: number) {}
+  constructor(limit: number) {
+    // 通用原语的自带防线：limit≤0 / NaN 会让 acquire 永久排队（所有等待者饿死），fail-fast 而不是静默死锁
+    const n = Math.floor(Number(limit));
+    if (!Number.isFinite(n) || n < 1) {
+      throw new TypeError(`Semaphore limit 必须为 ≥1 的有限数字（收到 ${limit}）`);
+    }
+    this.limit = n;
+  }
 
   private acquire(): Promise<void> {
     if (this.active < this.limit) {

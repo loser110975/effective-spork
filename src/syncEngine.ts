@@ -1,28 +1,29 @@
 import { App, Notice, TFile, normalizePath } from "obsidian";
-import { DouyinClient } from "./douyinClient";
+import { DouyinClient, isFolderApiUnavailableError } from "./douyinClient";
 import { createAsrProvider } from "./asr";
 import { AiClient } from "./ai";
+import { resolveAiChannel, resolveVisionChannel, resolveVideoSummaryChannel, isQuotaExhaustedError } from "./aiConfig";
 import { MediaStore } from "./media";
-import { VideoMediaStore, VideoAssets } from "./videoMedia";
+import { VideoMediaStore, VideoAssets, isDeterministicMediaError, type MediaErrorKind } from "./videoMedia";
 import { generateBases } from "./bases";
 import { buildNote, planNotePath } from "./noteBuilder";
-import { generateAndWriteVideoSummary, listVideoFramePaths } from "./videoSummaryService";
-import { pushSummaryRecord } from "./summaryService";
-import { extractSummarySources, collectExistingAssets, upsertAbstractBlock, type ReusedNoteAssets } from "./statusCore";
+import { generateAndWriteVideoSummary, listVideoFramePaths, SUMMARY_V } from "./videoSummaryService";
+import { extractSummarySources, collectExistingAssets, applySummaryToNote, frontmatterBlock, pushSummaryRecord, type ReusedNoteAssets } from "./statusCore";
+import { applyRelatedToNote, buildRelatedBlock, pickRelatedLinks, type RelatedCandidate, type RelatedLink } from "./relatedNotes";
 import {
   DouyinSyncSettings,
   SyncState,
   SyncItem,
   DouyinAwemeRaw,
   AsrResult,
-  AsrRetryEntry,
   StageTimings,
   SOURCE_LABEL,
 } from "./types";
 import { nowIso, parseList, noteTitleFor, sleep } from "./util";
 import { isAudioOnlyItem, AUDIO_ONLY_REASON } from "./itemType";
 import { clampConcurrency, mapLimit, Semaphore } from "./concurrency";
-import { detailStageTimings, summarizeStageTimings } from "./perf";
+import type { ItemSource } from "./types";
+import { detailStageTimings, summarizeStageTimings, StageTimer } from "./perf";
 
 export interface SyncSummary {
   total: number;
@@ -35,8 +36,51 @@ export interface SyncSummary {
   visionOk: number;
   videoSummaries: number;
   errors: string[];
+  /** 提示性信息（2026-09-27 自 errors 拆出）：Bases 已生成 / 重试延后等，观感不像报错 */
+  notices: string[];
   startedAt: string;
   finishedAt: string;
+}
+
+// ---------- processItem 管线的阶段产物类型（2026-09-27 第七轮拆分，字段即拆分前的局部变量） ----------
+
+/** 单图 OCR 结果行（recognizeImageTexts → buildNote 的 visionTexts 形状）。 */
+interface VisionRow {
+  index: number;
+  text: string;
+  status: string;
+}
+
+/** 视频素材阶段产物：assets 供写笔记/摘要用；needAudio 与素材错误类别供转写阶段做失败分类。 */
+interface VideoAssetsOutcome {
+  assets: VideoAssets | null;
+  needAudio: boolean;
+  mediaErrorKind: MediaErrorKind;
+  mediaPullError: string;
+  /** 本次 framePaths 的真实抽帧间隔（秒），0 = 无帧。回写 frame_interval 用（第九轮 A1）。 */
+  frameIntervalSec: number;
+}
+
+/** 图文图片阶段产物：images 进笔记图片块；localImageByIndex 供 OCR 复用已下载字节（免二次走 CDN）。 */
+interface ImageDownloads {
+  images: string[];
+  localImageByIndex: Map<number, string>;
+}
+
+/** 写笔记阶段输入。 */
+interface NoteWriteInput {
+  item: SyncItem;
+  folder: string;
+  overwritePath?: string;
+  reused: ReusedNoteAssets | null;
+  category: string;
+  coverPath: string;
+  imagesDownloaded: string[];
+  visionTexts: VisionRow[];
+  asr: AsrResult | null;
+  assets: VideoAssets | null;
+  /** 本次帧的真实抽帧间隔（秒），0 = 无帧（第九轮 A1：不再盲写当前设置值） */
+  frameIntervalSec: number;
 }
 
 /**
@@ -73,6 +117,7 @@ function newSyncSummary(): SyncSummary {
     visionOk: 0,
     videoSummaries: 0,
     errors: [],
+    notices: [],
     startedAt: "",
     finishedAt: "",
   };
@@ -100,6 +145,31 @@ export class SyncEngine {
   private visionAi: AiClient | null = null;
   /** OCR 全局并发闸门：跨条目统一限流，避免条目级 × 图片级并发把请求放大 9 倍（见 visionConcurrency 说明） */
   private ocrGate: Semaphore | null = null;
+  /**
+   * 本次同步的转写预算（2026-09-27 第四轮）：maxTranscribePerSync 此前只约束重试队列，
+   * 全新条目的转写完全不受限——首次全量同步 1000 条会一次性烧掉几百条转写费。
+   * processItem 的转写分支先扣减本计数，耗尽后条目进 pendingAsr（不 bump attempts），下次同步续传。
+   */
+  private asrBudgetLeft = 0;
+  /** 详情接口串行闸门（2026-09-27 第四轮）：直连模式下 backfill 并发条目各自 getAwemeDetail
+   *  会绕开「抖音 API 串行」的风控口径；桥接模式桥内已串行，此闸门仅对直连生效。 */
+  private detailGate = new Semaphore(1);
+  /** 主动落盘定时器（2026-09-27 第四轮）：节流的时间阈值是被动检查，长阶段（转写/摘要）
+   *  期间无人调 markStateDirty 时，脏窗口会被拉长到整个阻塞期，崩溃丢整段进度。 */
+  private flushTimer: number | null = null;
+  /**
+   * 视频摘要配额熔断（2026-10-01 第十三轮，真实数据驱动）：09-21 补跑实测出现 50 连发相同的
+   * 「Free quota exhausted」403——配额耗尽后每条视频照样白打一次调用（summary records 全红），
+   * 更贵的是 needFrames 恒真让每条新视频都为「无人消费的帧」白付全片下载 + ffmpeg
+   * （该次 metrics：ffmpeg p50 37.8s × 62 条）。会话级熔断：连续 3 次配额类失败后，
+   * 本次运行跳过摘要阶段并抑制帧路；每次 syncAll / backfillVideos 开始时复位重新探测
+   * （配额可能已恢复；每轮最多付 3 次轻量 403 的探明成本）。
+   */
+  private videoSummaryQuotaFails = 0;
+  private videoSummaryQuotaDead = false;
+
+  /** 桥接拉起函数（refreshClients 重建 DouyinClient 时复用）。 */
+  private spawnBridgeFn?: () => Promise<void>;
 
   constructor(
     private app: App,
@@ -108,6 +178,7 @@ export class SyncEngine {
     private onStatus: (text: string) => void,
     spawnBridge?: () => Promise<void>,
   ) {
+    this.spawnBridgeFn = spawnBridge;
     this.client = new DouyinClient(
       settings.cookie,
       settings.bridgeEnabled ? settings.bridgeUrl : undefined,
@@ -128,11 +199,24 @@ export class SyncEngine {
    */
   refreshClients(): void {
     const s = this.settings;
+    // DouyinClient 同样按最新设置重建（2026-09-27 修）：构造时只捕获一次 cookie / bridgeEnabled / bridgeUrl，
+    // 用户在设置页换 Cookie 或切换直连/桥接后，不重建的话定时同步仍拿旧值跑——
+    // 而「测试连接」每次 new 新客户端会显示成功，形成「测试通过但同步失败」的排查陷阱。
+    this.client = new DouyinClient(s.cookie, s.bridgeEnabled ? s.bridgeUrl : undefined, this.spawnBridgeFn);
+    this.videoMedia.updateClient(this.client);
+    // 媒体目录同样按最新设置重建（2026-09-27 第四轮）：MediaStore/VideoMediaStore 在构造期
+    // 快照 mediaFolder，不重建的话改设置后封面/帧仍写旧目录——更糟的是补跑的帧查找用实时
+    // settings、入库用旧目录，两处错位让补跑永远找不到帧、每轮白付一次全片下载 + ffmpeg。
+    this.media = new MediaStore(this.app.vault, s.mediaFolder);
+    this.videoMedia = new VideoMediaStore(this.app.vault, s.mediaFolder, s, this.client);
     this.ai = null;
     this.visionAi = null;
     this.ocrGate = null;
-    if (s.aiKey || s.dashscopeKey) {
-      this.ai = new AiClient(s.aiBaseUrl, s.aiKey || s.dashscopeKey, s.aiModel);
+    // 统一接入：Base URL + API Key 由 aiConfig 从 settings 解析（含旧配置回退链）。
+    // 配置不完整时此处仍不建客户端（保持原行为），真正发起请求时由 AiClient / 各服务抛出明确配置错误。
+    const aiChan = resolveAiChannel(s);
+    if (aiChan.apiKey) {
+      this.ai = new AiClient(aiChan.baseUrl, aiChan.apiKey, s.aiModel);
       this.ai.setVisionModel(s.visionModel);
       // 超时下调（性能实测）：分类实测 0.2s、单图 base64 OCR 正常 <20s，
       // 默认 120s 只会让失败路径白等两分钟（原 OCR 的 240s 里就有这一项）。
@@ -140,17 +224,10 @@ export class SyncEngine {
     }
     // OCR 视觉通道：独立基址/Key 留空时复用通用 AI 通道。
     // 注意：若配了独立基址却复用主通道 Key，会出现「基址与 Key 不匹配」
-    // （例如百炼基址 + 硅基流动 Key → 全部 401）。因此配了 visionBaseUrl 时，Key 优先取 visionApiKey，其次百炼 Key。
-    const hasOwnVisionBase = !!s.visionBaseUrl.trim();
-    const vKey = (
-      s.visionApiKey ||
-      (hasOwnVisionBase ? s.dashscopeKey : "") ||
-      s.aiKey ||
-      s.dashscopeKey
-    ).trim();
-    const vBase = (s.visionBaseUrl || s.aiBaseUrl).trim();
-    if (vKey) {
-      this.visionAi = new AiClient(vBase, vKey, s.aiModel, s.visionModel);
+    // （例如百炼基址 + 硅基流动 Key → 全部 401）。回退优先级由 resolveVisionChannel 统一维护。
+    const vChan = resolveVisionChannel(s);
+    if (vChan.apiKey) {
+      this.visionAi = new AiClient(vChan.baseUrl, vChan.apiKey, s.aiModel, s.visionModel);
       this.visionAi.setTimeoutMs(60_000);
       this.ocrGate = new Semaphore(clampConcurrency(s.visionConcurrency, 3));
     }
@@ -161,15 +238,26 @@ export class SyncEngine {
     return this.videoMedia.checkFfmpeg(force);
   }
 
+  /** onload 即清理上次会话的临时素材残留（P3-2）：懒清理要等首次视频素材拉取，图文-only 用户永不触发。 */
+  cleanupTempRoot(): void {
+    this.videoMedia.clearTempRoot();
+  }
+
   async loadState(raw: unknown) {
     if (raw && typeof raw === "object") {
       const s = raw as Partial<SyncState>;
+      // 台账形状校验（2026-09-27 第四轮）：data.json 手改/旧版本残留可能把 processed 写成
+      // 字符串、pendingAsr 写成非数组——原实现只兜 null/undefined，错位类型会在 processItem
+      // 的赋值或 syncAll 的 filter 处抛 TypeError，整轮同步异常退出
+      const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+        !!v && typeof v === "object" && !Array.isArray(v);
+      const isStrArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
       this.state = {
-        processed: s.processed ?? {},
-        pendingAsr: s.pendingAsr ?? [],
-        asrRetry: s.asrRetry ?? {},
+        processed: (isPlainObject(s.processed) ? s.processed : {}) as SyncState["processed"],
+        pendingAsr: isStrArray(s.pendingAsr) ? s.pendingAsr : [],
+        asrRetry: (isPlainObject(s.asrRetry) ? s.asrRetry : {}) as SyncState["asrRetry"],
         // 性能埋点（P2-15）：兼容旧 data.json，缺省给空数组
-        metrics: s.metrics ?? [],
+        metrics: Array.isArray(s.metrics) ? s.metrics : [],
         lastPerfSummary: s.lastPerfSummary,
         lastSyncAt: s.lastSyncAt,
         lastSyncSummary: s.lastSyncSummary,
@@ -184,10 +272,46 @@ export class SyncEngine {
           lastErrorCode: null,
           updatedAt: null,
         },
-        vision: s.vision ?? [],
-        summary: s.summary ?? [],
+        vision: Array.isArray(s.vision) ? s.vision : [],
+        summary: Array.isArray(s.summary) ? s.summary : [],
+        backfillFails: (isPlainObject(s.backfillFails) ? s.backfillFails : {}) as SyncState["backfillFails"],
+        transcriptCache: (isPlainObject(s.transcriptCache) ? s.transcriptCache : {}) as SyncState["transcriptCache"],
       };
       this.noteIndex = null; // 台账整体替换 → 反向索引失效，待懒建
+      // asrRetry 条目形状消毒（第六轮）：手改 data.json 里 attempts 非数字会让 bumpAsrRetry 的
+      // attempts+1 变字符串拼接、BACKOFF[NaN] 变 undefined，new Date(NaN).toISOString() 抛
+      // RangeError 冲出 retryPendingAsr 的 catch、中止本轮全部重试（每次同步复现）
+      if (this.state.asrRetry) {
+        for (const [k, v] of Object.entries(this.state.asrRetry)) {
+          const attempts = Number((v as { attempts?: unknown })?.attempts);
+          const t = Date.parse(String((v as { nextRetryAt?: unknown })?.nextRetryAt ?? ""));
+          this.state.asrRetry[k] = {
+            attempts: Number.isFinite(attempts) && attempts >= 0 ? Math.floor(attempts) : 0,
+            lastError: String((v as { lastError?: unknown })?.lastError ?? "").slice(0, 200),
+            nextRetryAt: Number.isFinite(t) ? new Date(t).toISOString() : new Date(0).toISOString(),
+            dead: Boolean((v as { dead?: unknown })?.dead),
+          };
+        }
+      }
+      // transcriptCache 条目形状消毒（第九轮复审批 1）：顶层 isPlainObject 只挡整体错位，
+      // 手改 data.json 出的条目级脏值（transcript 非字符串）会穿过 peekStashedTranscript 的
+      // 真值检查流进 asrOverride → buildNote 渲染出非文本内容。与 asrRetry 同口径逐条校验：
+      // transcript 非非空字符串的条目直接丢弃（宁可下轮重新计费，也不把脏值当已付费转录复用）
+      if (isPlainObject(this.state.transcriptCache)) {
+        const clean: NonNullable<SyncState["transcriptCache"]> = {};
+        for (const [k, v] of Object.entries(this.state.transcriptCache)) {
+          const e = v as { transcript?: unknown; provider?: unknown; at?: unknown } | null;
+          if (e && typeof e.transcript === "string" && e.transcript) {
+            const at = typeof e.at === "string" ? Date.parse(e.at) : NaN;
+            clean[k] = {
+              transcript: e.transcript,
+              provider: typeof e.provider === "string" ? e.provider : "",
+              at: Number.isFinite(at) ? new Date(at).toISOString() : new Date(0).toISOString(),
+            };
+          }
+        }
+        this.state.transcriptCache = clean;
+      }
     }
   }
 
@@ -203,6 +327,9 @@ export class SyncEngine {
       processManager: this.state.processManager,
       vision: this.state.vision,
       summary: this.state.summary,
+      backfillFails: {},
+      // 转写暂存是成本保护数据：清掉的话「重置台账后重同步」会对未落账的已付费转录重新计费
+      transcriptCache: this.state.transcriptCache,
     };
     this.noteIndex = null;
     void this.onStateChange();
@@ -217,6 +344,20 @@ export class SyncEngine {
     this.opsSinceFlush++;
     if (this.opsSinceFlush >= FLUSH_EVERY_OPS || Date.now() - this.lastFlushAt >= FLUSH_EVERY_MS) {
       void this.flushState();
+      return;
+    }
+    // 主动定时器（2026-09-27 第四轮）：时间阈值原是被动检查——连续 9 条处理后进入一条
+    // 5-10 分钟的转写/摘要长任务，期间无人调 markStateDirty，30s 阈值不会触发，
+    // 崩溃丢整段进度（含已计费转写）。定时器保证脏窗口不超过 FLUSH_EVERY_MS。
+    if (this.flushTimer === null) {
+      // window/globalThis 兼容（第六轮）：定时器逻辑要能在 Node 单测环境跑（obsidian 是
+      // Electron 渲染层有 window，node 里只有 globalThis）
+      const g: { setTimeout: (fn: () => void, ms: number) => number; clearTimeout: (t: number) => void } =
+        typeof window !== "undefined" ? window : (globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => number; clearTimeout: (t: number) => void });
+      this.flushTimer = g.setTimeout(() => {
+        this.flushTimer = null;
+        if (this.dirty) void this.flushState();
+      }, FLUSH_EVERY_MS);
     }
   }
 
@@ -230,6 +371,10 @@ export class SyncEngine {
     this.dirty = false;
     this.opsSinceFlush = 0;
     this.lastFlushAt = Date.now();
+    if (this.flushTimer !== null) {
+      (typeof window !== "undefined" ? window : (globalThis as unknown as { clearTimeout: (t: number) => void })).clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
     const p = this.onStateChange().catch(() => {
       this.dirty = true; // 写盘失败 → 重新标脏，下一次补写
     });
@@ -285,7 +430,8 @@ export class SyncEngine {
     if (!Number.isFinite(from)) return all;
     return all.filter((m) => {
       const t = Date.parse(m.recordedAt);
-      return !Number.isFinite(t) || t >= from;
+      // 时间戳损坏的历史样本（手改 data.json / 旧版本数据）直接排除，不再混进「本次」画像
+      return Number.isFinite(t) && t >= from;
     });
   }
 
@@ -298,6 +444,32 @@ export class SyncEngine {
   /** 分阶段明细（命令「查看同步性能画像」用）。 */
   perfDetail(): string {
     return detailStageTimings(this.state.metrics ?? []);
+  }
+
+  /**
+   * 转写重试队列一行画像（命令「查看转写重试队列」用）：
+   * 队列规模 / 待试 / 退避中 / dead-letter，dead 条目附最后一次错误摘录，供人工判断是否值得手工处理。
+   */
+  retryQueueSummary(): string {
+    const pending = this.state.pendingAsr ?? [];
+    const retry = this.state.asrRetry ?? {};
+    const dead = pending.filter((id) => retry[id]?.dead);
+    const deferred = pending.filter((id) => {
+      const e = retry[id];
+      if (!e || e.dead) return false;
+      const t = Date.parse(e.nextRetryAt);
+      return Number.isFinite(t) && t > Date.now();
+    });
+    const readyNow = pending.length - dead.length - deferred.length;
+    const lines: string[] = [
+      `转写重试队列：共 ${pending.length} 条｜可立即试 ${readyNow}｜退避中 ${deferred.length}｜已放弃(dead) ${dead.length}`,
+    ];
+    for (const id of dead.slice(0, 5)) {
+      lines.push(`  ✗ ${id}：${(retry[id]?.lastError ?? "").slice(0, 80)}`);
+    }
+    if (dead.length > 5) lines.push(`  … 其余 ${dead.length - 5} 条见 data.json → state.asrRetry`);
+    if (pending.length === 0) lines.length = 1;
+    return lines.join("\n");
   }
 
   /** 反向索引懒建（问题 8）：从 processed 台账一次性装载 id → path。 */
@@ -324,10 +496,16 @@ export class SyncEngine {
       // 设置可能在本会话内被改过（Obsidian 改设置不会重载插件）→ 按最新设置重建 AI 客户端，
       // 否则「在设置页换了 OCR 通道/模型」不会生效（实测踩坑：换了通道仍打旧服务端并持续 503）。
       this.refreshClients();
+      // 配额熔断复位（每轮重新探测，见字段注释）
+      this.videoSummaryQuotaFails = 0;
+      this.videoSummaryQuotaDead = false;
       let asrBudget = this.settings.maxTranscribePerSync;
 
       // 1) 重试上次失败的转写
       asrBudget = await this.retryPendingAsr(asrBudget, summary, notice);
+      // 剩余预算交给新条目的转写（2026-09-27 第四轮）：此前 maxTranscribePerSync 只约束重试，
+      // 全新条目无上限——首次全量同步一次性烧掉几百条转写费
+      this.asrBudgetLeft = Math.max(0, asrBudget);
 
       const whitelist = parseList(this.settings.folderWhitelist);
 
@@ -339,7 +517,11 @@ export class SyncEngine {
             const folders = await this.client.listFolders(0, 100);
             const targets = whitelist.length ? folders.filter((f) => whitelist.includes(f.name)) : folders;
             if (folders.length === 0) {
-              summary.errors.push("收藏夹列表为空（可能无收藏夹或接口变更）");
+              summary.notices.push("收藏夹列表为空（可能无收藏夹或接口变更）");
+            }
+            // 白名单一个都匹配不到（收藏夹改名/拼写不一致）：原实现静默零同步且无任何提示
+            if (whitelist.length > 0 && targets.length === 0) {
+              summary.errors.push(`收藏夹白名单均未匹配到（${whitelist.join("、")}），请核对设置中的收藏夹名称`);
             }
             for (const f of targets) {
               this.onStatus(`同步收藏夹：${f.name}`);
@@ -348,7 +530,16 @@ export class SyncEngine {
             }
             folderOk = targets.length > 0 || whitelist.length > 0;
           } catch (e: any) {
-            summary.errors.push(`收藏夹模式失败：${e?.message ?? e}`);
+            const msg = String(e?.message ?? e);
+            // 404 = 收藏夹 API 已被抖音网关下线（2026-10-01 实测：/aweme/v1/web/collection/*
+            // 整个子树返回 404 "Unsupported path(Janus)"，list 与 item/list 双双失效）。
+            // 这是确定性结果——每次同步都报 error 纯属噪音（扁平兜底本就覆盖全部收藏内容），
+            // 降级为 notice；其余错误（网络/5xx）维持 error 观感。
+            if (isFolderApiUnavailableError(msg)) {
+              summary.notices.push(`收藏夹接口已不可用（抖音 API 变更），本次按扁平模式同步全部收藏（${msg.slice(0, 60)}）`);
+            } else {
+              summary.errors.push(`收藏夹模式失败：${msg}`);
+            }
           }
         }
         // 3) 扁平兜底（无白名单时；或收藏夹模式失败时）
@@ -389,7 +580,7 @@ export class SyncEngine {
       if (this.settings.generateBases) {
         try {
           const n = await generateBases(this.app.vault, this.settings.basesFolder);
-          if (n > 0) summary.errors.push(`已生成 ${n} 个 Bases 文件`);
+          if (n > 0) summary.notices.push(`已生成 ${n} 个 Bases 文件（已存在的不覆盖）`);
         } catch (e: any) {
           summary.errors.push(`Bases 生成失败：${e?.message ?? e}`);
         }
@@ -410,7 +601,11 @@ export class SyncEngine {
       const msg =
         `抖音同步完成：新增 ${summary.created}，跳过 ${summary.skipped}，` +
         `转写成功 ${summary.transcribed}，视频摘要 ${summary.videoSummaries}，转写失败 ${summary.asrFailed}` +
-        (summary.errors.length ? `。注意：${summary.errors[0]}` : "");
+        (summary.errors.length
+          ? `。注意：${summary.errors[0]}`
+          : summary.notices.length
+            ? `。${summary.notices[0]}`
+            : "");
       notice.setMessage(msg);
       setTimeout(() => notice.hide(), 6000);
       this.onStatus(`上次同步 ${new Date().toLocaleTimeString("zh-CN")}`);
@@ -420,6 +615,8 @@ export class SyncEngine {
       setTimeout(() => notice.hide(), 8000);
       summary.errors.push(String(e?.message ?? e));
       summary.finishedAt = nowIso();
+      // 异常退出也要把节流窗口内的进度落盘（flushState 内部自带失败重标脏，不会二次抛出）
+      await this.saveState().catch(() => {});
       return summary;
     } finally {
       this.running = false;
@@ -458,7 +655,22 @@ export class SyncEngine {
     }
     if (fresh.length === 0) return { created: 0, streak };
     const limit = clampConcurrency(this.settings.syncConcurrency, 3);
-    const results = await mapLimit(fresh, limit, (it) => this.processItem(it, folder, summary, notice));
+    // 同页重复 id 防线（第九轮 A3 补强）：并发 ≥2 时「先到者写台账后后到者再检查」的时序
+    // 保证不成立——两个同 id 任务可同时启动、都在对方 finalize 前通过检查，造成双重 ASR 计费
+    // 与同一计划路径两次并发全量重写。任务入队即登记 in-flight，结束后解除。
+    const inflight = new Set<string>();
+    const results = await mapLimit(fresh, limit, async (it) => {
+      if (this.state.processed[it.id] || inflight.has(it.id)) {
+        summary.skipped++;
+        return false;
+      }
+      inflight.add(it.id);
+      try {
+        return await this.processItem(it, folder, summary, notice);
+      } finally {
+        inflight.delete(it.id);
+      }
+    });
     return { created: results.filter(Boolean).length, streak };
   }
 
@@ -476,8 +688,14 @@ export class SyncEngine {
       summary.total += res.items.length;
       const r = await this.consumePage(res.items, "collection", folderName, summary, notice);
       created += r.created;
-      processedStreak = r.streak;
-      if (processedStreak >= this.settings.scanStopAfterProcessed) break;
+      // streak 累计（2026-09-27 修回归）：consumePage 的 streak 是「页尾连续已处理数」（单页最大 = 页大小 20），
+      // 必须**跨页累加**才能达到 scanStopAfterProcessed（默认 100）；原重构误写成替换，
+      // 导致提前停止永不触发、每次同步都把收藏列表完整翻到最后。
+      // 页尾 streak=0 说明最后一条是新条目 → 清零，与重构前的「遇新归零」语义一致。
+      processedStreak = r.streak > 0 ? processedStreak + r.streak : 0;
+      // scanStopAfterProcessed ≤0（手改 data.json）时视为禁用提前停止（2026-09-27 第四轮）：
+      // 原 `0 >= 0` 恒真会让每个来源只扫一页，静默漏同步
+      if (this.settings.scanStopAfterProcessed > 0 && processedStreak >= this.settings.scanStopAfterProcessed) break;
       if (!res.hasMore || res.items.length === 0) break;
       cursor = res.cursor ?? cursor + 20;
       await sleep(600);
@@ -496,8 +714,8 @@ export class SyncEngine {
       const res = await this.client.listCollection(cursor, 20);
       summary.total += res.items.length;
       const r = await this.consumePage(res.items, "collection", defaultFolder, summary, notice);
-      processedStreak = r.streak;
-      if (processedStreak >= this.settings.scanStopAfterProcessed) break;
+      processedStreak = r.streak > 0 ? processedStreak + r.streak : 0; // streak 跨页累计（见 syncCollectionFolder 注释）
+      if (this.settings.scanStopAfterProcessed > 0 && processedStreak >= this.settings.scanStopAfterProcessed) break;
       if (!res.hasMore || res.items.length === 0) break;
       cursor = res.cursor ?? cursor + 20;
       await sleep(600);
@@ -516,8 +734,8 @@ export class SyncEngine {
       const res = await fetcher(cursor, 20);
       summary.total += res.items.length;
       const r = await this.consumePage(res.items, source, "", summary, notice);
-      processedStreak = r.streak;
-      if (processedStreak >= this.settings.scanStopAfterProcessed) break;
+      processedStreak = r.streak > 0 ? processedStreak + r.streak : 0; // streak 跨页累计（见 syncCollectionFolder 注释）
+      if (this.settings.scanStopAfterProcessed > 0 && processedStreak >= this.settings.scanStopAfterProcessed) break;
       if (!res.hasMore || res.items.length === 0) break;
       cursor = res.cursor ?? cursor + 20;
       await sleep(600);
@@ -526,6 +744,12 @@ export class SyncEngine {
 
   // ---------- 单条处理 ----------
 
+  /**
+   * 单条收藏的处理管线（2026-09-27 第七轮拆分：原 340 行单函数 → 编排器 + 9 个阶段方法）。
+   * 阶段顺序与计时键（perf.cut）保持拆分前逐位一致——state.metrics 的耗时画像口径不变。
+   * 行为不变式由 tests/sync-engine.test.mjs 的引擎级用例守护（processItem 全链路 / ASR 台账 /
+   * 预算顺延 / 来源还原 / 补跑筛选等）。
+   */
   private async processItem(
     item: SyncItem,
     folder: string,
@@ -534,269 +758,713 @@ export class SyncEngine {
     overwritePath?: string,
     asrOverride?: AsrResult | null,
     frameHint?: string[],
+    reextractFrames?: boolean,
   ): Promise<boolean> {
     try {
-      // ---- 阶段耗时埋点（P2-15）----
-      // 只做时间戳加减，不触碰任何控制流；结果进 state.metrics（保留最近 RECENT_METRICS 条）。
-      // 目的：让 §8.6 的优化收益可被量化验证，而不是只能靠端到端时间反推。
-      const perfT0 = Date.now();
-      const perf: Record<string, number> = {};
-      let ptStage = perfT0;
-      const cut = (key: string) => {
-        const now = Date.now();
-        perf[key] = (perf[key] ?? 0) + (now - ptStage);
-        ptStage = now;
-      };
-
+      const perf = new StageTimer();
       notice?.setMessage(`抖音同步：处理 ${noteTitleFor(item.title, item.id).slice(0, 24)}`);
-      // 素材错误类别按「条目」作用域清零：本次条目内 pullAssets 会重新写入，
-      // 避免上一条的 no_video_track 残留污染本条的失败分类。
-      this.videoMedia.lastErrorKind = "none";
 
-      // 问题 6（重试路径）：只重跑 transcribe + writeNote；封面/图片/OCR/分类从既有笔记回收，
-      // 不再触发二次下载、重复 OCR 与重复分类等全套副作用。回收失败则回退原联网路径。
-      let reused: ReusedNoteAssets | null = null;
-      if (overwritePath && asrOverride !== undefined) {
-        try {
-          const existingFile = this.app.vault.getAbstractFileByPath(normalizePath(overwritePath));
-          if (existingFile instanceof TFile) {
-            reused = collectExistingAssets(await this.app.vault.read(existingFile));
-          }
-        } catch {
-          reused = null;
+      // A2（第九轮）：全新路径撞上已存在笔记（台账丢失：节流落盘窗口内崩溃 / 重置状态后重同步）
+      // 时，原实现按 buildNote 全量覆盖——用户后续编辑与已付费的摘要块一并丢失。
+      // 按 id 现场定位后与重试路径共用同一套资产回收（封面/图片/OCR/分类/帧/摘要回填）。
+      // collided 标记区分「撞库恢复」与「调用方显式传入的重试/补跑路径」：两者的
+      // asrOverride 语义不同——撞库应优先复用笔记既有逐字稿，补跑则代表重出自愈意图。
+      let collided = false;
+      if (!overwritePath) {
+        const existing = this.findNotePath(item.id);
+        if (existing) {
+          overwritePath = existing;
+          collided = true;
         }
       }
-      cut("reuseMs");
 
-      // 封面
-      let coverPath = "";
-      if (reused?.coverPath) {
-        coverPath = reused.coverPath;
-      } else if (this.settings.downloadCover && item.coverUrl) {
-        coverPath = await this.media.saveImage(item.coverUrl, `cover/${item.id}`);
-      }
-      cut("coverMs");
-
-      // 视频素材（转录用音频 + 关键帧）：视频类专用分支；图文类不转录不抽帧。
-      // 重试路径（asrOverride 已带转写结果）不再为音频拉取，仅按需为摘要抽帧；
-      // 关键帧优先复用既有笔记里已入库的帧网格（问题 6），避免重试时重新拉视频跑 ffmpeg。
-      let assets: VideoAssets | null = null;
-      if (item.type === "video") {
-        const needAudio =
-          asrOverride === undefined &&
-          this.settings.asrProvider === "siliconflow_sensevoice" &&
-          !!this.settings.siliconflowKey;
-        const needFrames =
-          this.settings.videoSummaryEnabled && !!(this.settings.aiKey || this.settings.dashscopeKey);
-        const hint =
-          frameHint && frameHint.length > 0 ? frameHint : reused?.framePaths.length ? reused.framePaths : undefined;
-        if (needFrames && hint && hint.length > 0 && !needAudio) {
-          // 补跑且关键帧网格已符合当前设置：直接复用已入库帧，跳过 ffmpeg 重新拉取
-          assets = { audioPath: "", framePaths: hint };
-        } else if (needAudio || needFrames) {
-          assets = await this.videoMedia.pullAssets(item);
-          if (!assets) {
-            summary.errors.push(`[${item.id}] 视频素材拉取失败：${this.videoMedia.lastError.slice(0, 100)}`);
-          }
+      // B3（第九轮）：转写结果暂存命中 → 直接当 asrOverride 用，跳过音频拉取与 ASR 计费
+      //（上次转写成功但写笔记失败的情形，原实现下轮会重新计费一整次）；台账收尾时清除暂存。
+      // asrReused（第十轮复审批）：转录来自复用源（B3 暂存 / F1 笔记旧稿）时为 true——
+      // keepExistingSummary 与阶段 3 的 needFrames 抑制都由它门控。暂存命中同样可能撞库到
+      // 已有 v3 摘要的完整笔记（转写成功 → 写笔记失败 → 暂存 → 重置台账 → 撞库），此时
+      // 转录内容与笔记一致，重出摘要同样是纯浪费的付费调用 + 精修摘要被覆盖。
+      let asrReused = false;
+      if (asrOverride === undefined) {
+        const stashed = this.peekStashedTranscript(item.id);
+        if (stashed) {
+          asrOverride = stashed;
+          asrReused = true;
         }
       }
-      cut("ffmpegMs");
 
-      // 图文图片（重试路径复用既有笔记中已入库的图片，不重复下载）
-      const imagesDownloaded: string[] = [];
-      if (reused?.images.length) {
-        imagesDownloaded.push(...reused.images);
-      } else if (item.type === "note" && this.settings.downloadImages) {
-        const n = Math.min(item.imageUrls.length, this.settings.maxImages);
-        for (let i = 0; i < n; i++) {
-          const p = await this.media.saveImage(item.imageUrls[i], `images/${item.id}/${i + 1}`);
-          if (p) imagesDownloaded.push(p);
-          await sleep(200);
-        }
-      }
-      cut("imagesMs");
+      // 阶段 1：重试路径资产回收——只重跑转写 + 写笔记，封面/图片/OCR/分类从既有笔记回收（问题 6）
+      const reused = await this.collectReusedAssets(overwritePath);
+      perf.cut("reuseMs");
 
-      // 图片文字识别（重试路径复用既有笔记的识别文本，不重复调用视觉模型）
-      const visionTexts: { index: number; text: string; status: string }[] = [];
-      if (reused?.visionTexts.length) {
-        visionTexts.push(...reused.visionTexts);
-      } else if (
-        item.type === "note" &&
-        this.settings.enableVision &&
-        (this.visionAi || this.ai) &&
-        item.imageUrls.length > 0
+      // F1（第十轮）：撞库路径从笔记正文回收既有逐字稿。B3 暂存只覆盖「转写成功但写笔记失败」
+      // 的崩溃窗口（成功落账即清），对早已成功同步的视频笔记必然为空——台账丢失（重置状态/
+      // 节流窗口崩溃）后重同步时，原实现两路 asrOverride 都为空：预算内条目重新下载全片 +
+      // 重复计费 ASR，预算外条目被 asr=null 的 buildNote 降级重写（逐字稿块删除、
+      // transcript_status 退回 not_requested）。与 backfillVideos 的复用口径一致：
+      // success + 非空逐字稿直接构造 asrOverride，needAudio 随之为 false（免下载免计费）。
+      // 注意只对撞库路径生效——补跑传 asrOverride=undefined 是「重新转写自愈」的显式意图（A8），
+      // 不能被笔记旧稿劫持。
+      if (
+        collided &&
+        asrOverride === undefined &&
+        reused &&
+        item.type === "video" &&
+        reused.transcriptStatus === "success" &&
+        reused.transcript.trim()
       ) {
-        const ai = (this.visionAi || this.ai)!;
-        const gate = this.ocrGate;
-        const n = Math.min(item.imageUrls.length, this.settings.maxImages);
-        // 性能实测与根因（2026-09-19）：
-        // ① 原实现把抖音 CDN 的图片 URL 直接交给视觉模型服务端拉取 → 拉取慢/被拒时撞满 120s 超时再走 base64 重试；
-        //    而本地下载 10 张仅需 1.6s，故改为「先本地取字节转 base64」。
-        // ② 改完仍慢（实测 42~1092s）。笔记里的失败原因揭示真凶：
-        //    HTTP 503 {"code":50508,"message":"System is too busy now"} —— 视觉模型服务端过载。
-        //    而条目级并发 3 × 图片级并发 3 = 9 路同时打过去，只会让它更过载、单张更慢。
-        //    故 OCR 请求统一交给全局闸门（visionConcurrency）限流，与条目级并发解耦。
-        const rows = await mapLimit(
-          Array.from({ length: n }, (_, i) => i),
-          2,
-          async (i) => {
-            const url = item.imageUrls[i];
-            try {
-              const dataUrl = (await this.media.toDataUrl(url)) || url; // 下载失败时退回 URL 直传
-              const text = await (gate
-                ? gate.run(() => ai.ocrImage(dataUrl, item.title))
-                : ai.ocrImage(dataUrl, item.title));
-              if (text) summary.visionOk++;
-              return { index: i + 1, text, status: text ? "识别成功" : "未识别" };
-            } catch (e: any) {
-              return { index: i + 1, text: "", status: `识别失败：${String(e?.message ?? e).slice(0, 60)}` };
-            }
-          },
-        );
-        visionTexts.push(...rows); // mapLimit 结果保持输入顺序，index 与图片顺序一致
+        asrOverride = { status: "success", transcript: reused.transcript, provider: reused.transcriptProvider || "reused" };
+        asrReused = true;
       }
-      cut("ocrMs");
 
-      // ASR 逐字稿（asrOverride 非 undefined 时直接复用调用方结果，避免重试路径二次转写）
-      let asr: AsrResult | null = null;
-      if (asrOverride !== undefined) {
-        asr = asrOverride;
-      } else if (item.type === "video" && this.settings.asrProvider !== "none") {
-        if (isAudioOnlyItem(item)) {
-          // 策略 B（2026-09-21 实测定位）：aweme_type=163 / media_type=43 的条目在抖音侧
-          // **不提供视频轨**——video.duration=0、bit_rate=[]、download_addr=[]，
-          // play_addr.url_list[0] 直接指向背景音乐。本地 ffmpeg 拿不到视频轨（-map 0:v:0 必失败），
-          // 而走 URL 直传通道转出来的只是 BGM 歌词。
-          // 因此既不抽帧也不转写，直接记 unavailable 并移出重试队列，避免把配乐当逐字稿污染知识库。
-          asr = { status: "unavailable", transcript: "", provider: "none", error: AUDIO_ONLY_REASON };
-          summary.asrSkipped++;
-          this.clearAsrRetry(item.id);
-        } else {
-          const provider = createAsrProvider(this.settings, this.client, {
-            resolveAudio: (url, videoId, durationSec) =>
-              this.videoMedia.getAudio(videoId ?? "", url, durationSec ?? item.durationSec),
-          });
-          if (provider && item.playUrl) {
-            asr = await provider.transcribe(item.playUrl, item.id, { durationSec: item.durationSec });
-            if (asr.status === "success") {
-              summary.transcribed++;
-            } else if (asr.status === "unavailable") {
-              // 已调通接口、确认无可转写内容（纯音乐/无对白）→ 移出队列，不反复重试
-              summary.asrFailed++;
-              this.clearAsrRetry(item.id);
-            } else {
-              summary.asrFailed++;
-              if (this.videoMedia.lastFailureDeterministic || DETERMINISTIC_ASR_FAILURE_RE.test(asr.error ?? "")) {
-                // 素材侧失败是确定性的：重试必然复现同一结果，不入队（P2）
-                this.clearAsrRetry(item.id);
-                summary.errors.push(`转写失败（素材侧，不重试）：${(asr.error ?? "").slice(0, 70)}`);
-              } else {
-                this.enqueueAsrRetry(item.id, asr.error ?? asr.status);
-              }
-            }
-          } else if (!item.playUrl) {
-            asr = { status: "unavailable", transcript: "", error: "无播放地址" };
-          }
-        }
-      }
-      // 音频临时文件清理（帧图已入库 vault；缓存清除后下次需要时重新拉取）
-      if (assets) this.videoMedia.cleanup(item.id);
-      cut("asrMs");
+      // F2（第十轮）：撞库路径已有当前版本摘要时跳过阶段 9 重出。摘要回填（阶段 8）刚把
+      // 既有摘要写回笔记，若无门控，阶段 9 会立刻用现生成版本覆盖——重置状态后重同步会把
+      // 不可再生的精修摘要整批替换掉（328 篇 Agent 亲写层级体），且这是一次纯浪费的付费调用。
+      // 只保护「转录来自复用源」的路径：转录确实变化时（重新转写）照常重出。
+      const keepExistingSummary =
+        asrReused && !!reused?.summaryText && parseInt(reused.summaryV, 10) === SUMMARY_V;
 
-      // AI 分类（重试路径复用既有分类，不重复调用文本模型）
-      let category = "未分类";
-      if (reused?.category) {
-        category = reused.category;
-      } else if (this.settings.enableCategory && this.ai) {
-        const cats = parseList(this.settings.aiCategories);
-        if (cats.length > 0) {
-          try {
-            category = await this.ai.categorize(cats, item.title, item.desc, asr?.transcript ?? "");
-          } catch (e: any) {
-            summary.errors.push(`分类失败：${String(e?.message ?? e).slice(0, 80)}`);
-          }
-        }
-      }
-      cut("categoryMs");
+      // 阶段 2：封面
+      const coverPath = await this.resolveCover(item, reused);
+      perf.cut("coverMs");
 
-      // 写笔记
-      const title = noteTitleFor(item.title, item.id);
-      const path = overwritePath ?? planNotePath(this.settings.rootFolder, item, folder, title);
-      const content = buildNote({
+      // 阶段 3：视频素材（转录用音频 + 关键帧）——视频类专用，图文类不转录不抽帧。
+      // keepExistingSummary 透传（第十轮复审批）：摘要既不重出，帧就没有任何消费方——
+      // 不抑制的话 needFrames 恒真会为无帧笔记白跑一次全片下载 + ffmpeg 抽帧，
+      // 而 403 条撞库恢复里多数恰是无帧笔记（摘要已被保护跳过），整轮全是白付的 IO。
+      const video = await this.resolveVideoAssets(
+        item,
+        reused,
+        asrOverride,
+        frameHint,
+        reextractFrames === true,
+        summary,
+        keepExistingSummary,
+      );
+      perf.cut("ffmpegMs");
+
+      // 阶段 4：图文图片下载
+      const images = await this.downloadImages(item, reused);
+      perf.cut("imagesMs");
+
+      // 阶段 5：图片 OCR
+      const visionTexts = await this.recognizeImageTexts(item, reused, images.localImageByIndex, summary);
+      perf.cut("ocrMs");
+
+      // 阶段 6：ASR 逐字稿（asrOverride 非 undefined 时直接复用调用方结果，避免重试路径二次转写）
+      const asr = await this.transcribeVideo(
+        item,
+        summary,
+        asrOverride,
+        video.needAudio,
+        video.mediaErrorKind,
+        video.mediaPullError,
+      );
+      // 音频临时文件清理（帧图已入库 vault；缓存清除后下次需要时重新拉取）。
+      // 无条件调用（cleanup 幂等）：素材拉取失败时也要清掉临时目录——
+      // 旧写法 `if (assets)` 会让失败路径把最大 200MB 的 source.mp4 永久留在 OS 临时目录，失败一次泄一份。
+      this.videoMedia.cleanup(item.id);
+      perf.cut("asrMs");
+
+      // 阶段 7：AI 分类
+      const category = await this.categorizeItem(item, reused, asr, summary);
+      perf.cut("categoryMs");
+
+      // 阶段 8：写笔记（含既有摘要回填——重建会清掉摘要块，回填保证「摘要重生成失败」不抹掉已有摘要）
+      const { path, noteFile } = await this.writeItemNote({
         item,
         folder,
+        overwritePath,
+        reused,
         category,
         coverPath,
-        imagesDownloaded,
+        imagesDownloaded: images.images,
         visionTexts,
         asr,
-        framePaths: assets?.framePaths ?? [],
-        keyframeIntervalSec: assets ? Math.max(1, Math.min(60, this.settings.keyframeIntervalSec || 10)) : 0,
-        syncedAt: nowIso(),
+        assets: video.assets,
+        frameIntervalSec: video.frameIntervalSec,
       });
-      const noteFile = await this.writeNoteFile(path, content, overwritePath);
+      perf.cut("noteWriteMs");
 
-      // 关键修复：重建笔记会清掉既有摘要（buildNote 不含摘要块/frontmatter summary）。
-      // 先按既有摘要回填，保证「摘要重生成失败」不会把已有摘要永久抹掉；生成成功时再被覆盖。
-      if (noteFile && reused?.summaryText) {
-        try {
-          await this.app.fileManager.processFrontMatter(noteFile, (fm: Record<string, unknown>) => {
-            fm.summary = reused.summaryText;
-            const v = parseInt(reused.summaryV, 10);
-            fm.summary_v = Number.isFinite(v) && v > 0 ? v : 3;
-          });
-          const cur = await this.app.vault.read(noteFile);
-          await this.app.vault.modify(noteFile, upsertAbstractBlock(cur, reused.summaryText));
-        } catch {
-          /* 回填失败不影响主流程 */
-        }
-      }
-      cut("noteWriteMs");
+      // 阶段 9：视频多模态综合总结（自动；图文类不走此分支）。keepExistingSummary（第十轮 F2）：
+      // 撞库恢复且摘要已是当前版本时跳过，防既有精修摘要被现生成版本批量覆盖。
+      await this.runVideoSummary(item, noteFile, asr, video.assets, summary, keepExistingSummary);
+      perf.cut("summaryMs");
 
-      // 视频多模态综合总结（自动；图文类不走此分支）：转录文字 + 关键帧 → 百炼视觉模型
-      if (
-        item.type === "video" &&
-        this.settings.videoSummaryEnabled &&
-        (this.settings.aiKey || this.settings.dashscopeKey) &&
-        noteFile
-      ) {
-        try {
-          const r = await generateAndWriteVideoSummary(this.app, noteFile, this.settings, {
-            title: item.title,
-            desc: item.desc,
-            transcript: asr?.transcript ?? "",
-            framePaths: assets?.framePaths ?? [],
-          });
-          if (r.record) this.state.summary = pushSummaryRecord(this.state.summary, r.record);
-          if (r.ok) {
-            summary.videoSummaries++;
-          } else {
-            summary.errors.push(`[${item.id}] 视频摘要：${r.msg.slice(0, 100)}`);
-          }
-        } catch (e: any) {
-          summary.errors.push(`[${item.id}] 视频摘要异常：${String(e?.message ?? e).slice(0, 80)}`);
-        }
-      }
-      cut("summaryMs");
+      // 阶段 10：相关笔记互链（第八轮；图文/视频都走）。不设计时键——本阶段仅元数据
+      // 内存扫描 + 幂等块回写（毫秒级），不入 StageTimings（recordStageTimings 只取白名单键，
+      // 这里不加键即自然不落画像，metrics 口径不变）。
+      await this.linkRelatedNotes(item, noteFile, category);
 
-      this.state.processed[item.id] = {
-        path,
-        syncedAt: nowIso(),
-        folder: folder || SOURCE_LABEL[item.source],
-        asrStatus: asr?.status,
-      };
-      this.noteIndexGet().set(item.id, path); // 反向索引同步更新（问题 8）
-      // 转写成功 / 确认无语音：结清重试台账
-      if (asr?.status === "success" || asr?.status === "unavailable") {
-        this.clearAsrRetry(item.id);
-      }
-      this.recordStageTimings(item, perf, Date.now() - perfT0);
+      this.finalizeProcessed(item, path, folder, asr);
+      this.recordStageTimings(item, perf.perf, perf.totalMs());
       this.markStateDirty(); // 节流落盘（原 await saveState()：每条全量写 689KB）
       summary.created++;
       return true;
     } catch (e: any) {
       summary.errors.push(`[${item.id}] ${String(e?.message ?? e).slice(0, 100)}`);
+      // 失败也要触发落盘（第九轮 B3）：转写暂存写在 state 里，不落盘的话崩溃窗口内暂存丢失，
+      // 下轮仍会重新计费
+      this.markStateDirty();
       return false;
+    }
+  }
+
+  /** 阶段 1：资产回收（重试路径与「全新撞库」路径共用）。回收失败回退 null（调用方走原联网路径）。 */
+  private async collectReusedAssets(overwritePath: string | undefined): Promise<ReusedNoteAssets | null> {
+    // 门控放宽为只看 overwritePath（第九轮 A2）：全新路径撞上已存在笔记时同样要回收资产，
+    // 原实现要求 asrOverride 非 undefined，撞库条目的摘要/封面/帧全部白丢
+    if (!overwritePath) return null;
+    try {
+      const existingFile = this.app.vault.getAbstractFileByPath(normalizePath(overwritePath));
+      if (existingFile instanceof TFile) {
+        return collectExistingAssets(await this.app.vault.read(existingFile));
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 阶段 2：封面。重试路径复用既有封面，否则按设置下载。 */
+  private async resolveCover(item: SyncItem, reused: ReusedNoteAssets | null): Promise<string> {
+    if (reused?.coverPath) return reused.coverPath;
+    if (this.settings.downloadCover && item.coverUrl) {
+      return this.media.saveImage(item.coverUrl, `cover/${item.id}`);
+    }
+    return "";
+  }
+
+  /**
+   * 阶段 3：视频素材（转录用音频 + 关键帧）。重试路径（asrOverride 已带转写结果）不再拉音频，
+   * 仅按需为摘要抽帧；关键帧优先复用既有笔记里已入库的帧网格（问题 6）。
+   * 素材门控在函数级（第六轮接手收尾）：转写阶段的「素材已失败」快捷路径要读 needAudio——
+   * 前会话的编辑事故（条件表达式丢失）正发生在此处。
+   * 素材错误类别随本次 pullAssets 结果走（结构化返回值），无需共享字段清零——
+   * 旧共享字段在条目级并发下会被其他条目覆写，导致确定性失败误入重试队列、或可重试失败被误删（2026-09-27 修）。
+   */
+  private async resolveVideoAssets(
+    item: SyncItem,
+    reused: ReusedNoteAssets | null,
+    asrOverride: AsrResult | null | undefined,
+    frameHint: string[] | undefined,
+    reextractFrames: boolean,
+    summary: SyncSummary,
+    summaryProtected = false,
+  ): Promise<VideoAssetsOutcome> {
+    const needAudio =
+      asrOverride === undefined &&
+      this.settings.asrProvider === "siliconflow_sensevoice" &&
+      !!this.settings.siliconflowKey;
+    // 摘要门控按实际解析链判定（2026-09-27 第四轮）：原写死 `aiKey || dashscopeKey`，
+    // 只配了 videoSummaryApiKey（设置页「多模态 API Key」）的用户 needFrames 恒 false——
+    // 不拉视频不抽帧、摘要分支整体跳过，且无任何报错，专用通道静默失效。
+    // summaryProtected（第十轮复审批）：既有摘要被保护跳过时帧没有消费方，抑制帧路——
+    // 否则撞库恢复场景为无帧笔记白跑全片下载 + ffmpeg，成果又被阶段 9 的跳过丢掉
+    const needFrames =
+      !summaryProtected &&
+      !this.videoSummaryQuotaDead && // 配额熔断（第十三轮）：摘要无人消费时帧路一并抑制
+      this.settings.videoSummaryEnabled &&
+      !!resolveVideoSummaryChannel(this.settings).apiKey;
+    const wantInterval = Math.max(1, Math.min(60, this.settings.keyframeIntervalSec || 10));
+    let assets: VideoAssets | null = null;
+    let mediaErrorKind: MediaErrorKind = "none";
+    let mediaPullError = "";
+    let frameIntervalSec = 0;
+    if (item.type === "video") {
+      // 帧复用与「本次帧的真实间隔」（第九轮 A1/B7 重构）：
+      // - backfill 的 frameHint 只在帧网格达标（storedInterval === wantInterval）时传入 → 直接复用；
+      // - reused 帧回退：仅当没有重抽意图（reextractFrames=false），或本次没有任何拉取方
+      //   （needAudio/needFrames 全 false——回退只为保住笔记里已有的帧块）；
+      //   原实现 reused 帧无条件劫持，backfill 的重抽意图被吞掉且 frame_interval 被盖章成
+      //   当前设置，「改间隔/补帧」场景永久失效（下一轮 framesOk 恒真 → 永远 skipped）。
+      const hintFromBackfill = !!(frameHint && frameHint.length > 0);
+      const reuseOk = hintFromBackfill || !reextractFrames || (!needAudio && !needFrames);
+      const hint = hintFromBackfill
+        ? frameHint!
+        : reuseOk && reused?.framePaths.length
+          ? reused.framePaths
+          : undefined;
+      // 真实间隔：backfill 的 frameHint 保证与当前设置一致；reused 帧以笔记 frontmatter 记录为准
+      //（旧笔记缺记录时按当前设置收编，避免每轮都重进候选集）
+      const hintInterval = hintFromBackfill
+        ? wantInterval
+        : parseInt(reused?.frameInterval ?? "", 10) || wantInterval;
+      if (hint && hint.length > 0 && !needAudio) {
+        assets = { audioPath: "", framePaths: hint };
+        frameIntervalSec = hintInterval;
+      } else if (needAudio || needFrames) {
+        // B7（第九轮）：已有完好帧网格时不再为「只要音频」的拉取重编帧路（免一次全片解码 + JPEG 编码）
+        const pulled = await this.videoMedia.pullAssets(item, {
+          wantAudio: needAudio,
+          wantFrames: needFrames && !(hint && hint.length > 0),
+        });
+        assets = pulled.assets;
+        mediaErrorKind = pulled.errorKind;
+        if (!assets) {
+          mediaPullError = pulled.error;
+          summary.errors.push(`[${item.id}] 视频素材拉取失败：${pulled.error.slice(0, 100)}`);
+        } else if (assets.framePaths.length === 0 && hint && hint.length > 0) {
+          assets.framePaths = hint;
+          frameIntervalSec = hintInterval;
+        } else if (assets.framePaths.length > 0) {
+          frameIntervalSec = wantInterval;
+        }
+      }
+    }
+    return { assets, needAudio, mediaErrorKind, mediaPullError, frameIntervalSec };
+  }
+
+  /**
+   * 阶段 4：图文图片下载。重试路径复用既有笔记中已入库的图片，不重复下载；
+   * 同时登记序号 → 本地路径，供 OCR 阶段复用已下载字节。
+   */
+  private async downloadImages(item: SyncItem, reused: ReusedNoteAssets | null): Promise<ImageDownloads> {
+    const imagesDownloaded: string[] = [];
+    const localImageByIndex = new Map<number, string>(); // 图片序号 → 已入库路径（OCR 复用已下载字节，免二次走 CDN）
+    if (reused?.images.length) {
+      imagesDownloaded.push(...reused.images);
+      // 重试路径同样登记序号 → 本地路径（复审 P2）：否则 OCR 对已入库图片仍走 toDataUrl 重新下载
+      reused.images.forEach((p, i) => localImageByIndex.set(i, p));
+    } else if (item.type === "note" && this.settings.downloadImages) {
+      const n = Math.min(item.imageUrls.length, this.settings.maxImages);
+      for (let i = 0; i < n; i++) {
+        const p = await this.media.saveImage(item.imageUrls[i], `images/${item.id}/${i + 1}`);
+        if (p) {
+          imagesDownloaded.push(p);
+          localImageByIndex.set(i, p);
+        }
+        await sleep(200);
+      }
+    }
+    return { images: imagesDownloaded, localImageByIndex };
+  }
+
+  /**
+   * 阶段 5：图片 OCR。重试路径复用既有笔记的识别文本，不重复调用视觉模型。
+   * 性能实测与根因（2026-09-19）：
+   * ① 原实现把抖音 CDN 的图片 URL 直接交给视觉模型服务端拉取 → 拉取慢/被拒时撞满 120s 超时再走 base64 重试；
+   *    而本地下载 10 张仅需 1.6s，故改为「先本地取字节转 base64」。
+   * ② 改完仍慢（实测 42~1092s）。笔记里的失败原因揭示真凶：
+   *    HTTP 503 {"code":50508,"message":"System is too busy now"} —— 视觉模型服务端过载。
+   *    而条目级并发 3 × 图片级并发 3 = 9 路同时打过去，只会让它更过载、单张更慢。
+   *    故 OCR 请求统一交给全局闸门（visionConcurrency）限流，与条目级并发解耦。
+   */
+  private async recognizeImageTexts(
+    item: SyncItem,
+    reused: ReusedNoteAssets | null,
+    localImageByIndex: Map<number, string>,
+    summary: SyncSummary,
+  ): Promise<VisionRow[]> {
+    const visionTexts: VisionRow[] = [];
+    if (reused?.visionTexts.length) {
+      visionTexts.push(...reused.visionTexts);
+    } else if (
+      item.type === "note" &&
+      this.settings.enableVision &&
+      (this.visionAi || this.ai) &&
+      item.imageUrls.length > 0
+    ) {
+      const ai = (this.visionAi || this.ai)!;
+      const gate = this.ocrGate;
+      const n = Math.min(item.imageUrls.length, this.settings.maxImages);
+      const rows = await mapLimit(
+        Array.from({ length: n }, (_, i) => i),
+        2,
+        async (i) => {
+          const url = item.imageUrls[i];
+          try {
+            // 输入优先复用刚下载入库的同一张图（P1-10：此前同一条目的每张图会被下载两遍）；
+            // 文件读不到再退回 URL 重新下载，仍失败才退回 URL 直传
+            const localPath = localImageByIndex.get(i);
+            const dataUrl =
+              (localPath ? await this.media.dataUrlFromFile(localPath) : "") ||
+              (await this.media.toDataUrl(url)) ||
+              url;
+            const text = await (gate
+              ? gate.run(() => ai.ocrImage(dataUrl, item.title))
+              : ai.ocrImage(dataUrl, item.title));
+            if (text) summary.visionOk++;
+            return { index: i + 1, text, status: text ? "识别成功" : "未识别" };
+          } catch (e: any) {
+            return { index: i + 1, text: "", status: `识别失败：${String(e?.message ?? e).slice(0, 60)}` };
+          }
+        },
+      );
+      visionTexts.push(...rows); // mapLimit 结果保持输入顺序，index 与图片顺序一致
+    }
+    return visionTexts;
+  }
+
+  /**
+   * 阶段 6：ASR 逐字稿。asrOverride 非 undefined 时直接复用调用方结果（重试路径不二次转写）。
+   * 含无视频轨判定、素材失败快捷分类、转写预算扣减与重试台账簿记（入队/结清/顺延）。
+   */
+  private async transcribeVideo(
+    item: SyncItem,
+    summary: SyncSummary,
+    asrOverride: AsrResult | null | undefined,
+    needAudio: boolean,
+    mediaErrorKind: MediaErrorKind,
+    mediaPullError: string,
+  ): Promise<AsrResult | null> {
+    if (asrOverride !== undefined) return asrOverride;
+    if (item.type !== "video" || this.settings.asrProvider === "none") return null;
+    if (isAudioOnlyItem(item)) {
+      // 策略 B（2026-09-21 实测定位）：aweme_type=163 / media_type=43 的条目在抖音侧
+      // **不提供视频轨**——video.duration=0、bit_rate=[]、download_addr=[]，
+      // play_addr.url_list[0] 直接指向背景音乐。本地 ffmpeg 拿不到视频轨（-map 0:v:0 必失败），
+      // 而走 URL 直传通道转出来的只是 BGM 歌词。
+      // 因此既不抽帧也不转写，直接记 unavailable 并移出重试队列，避免把配乐当逐字稿污染知识库。
+      this.clearAsrRetry(item.id);
+      summary.asrSkipped++;
+      return { status: "unavailable", transcript: "", provider: "none", error: AUDIO_ONLY_REASON };
+    }
+    if (needAudio && mediaErrorKind !== "none") {
+      // 素材拉取已失败且 provider 需要本地音频（复审 P1；条件表达式由第六轮接手补回——
+      // 前会话编辑事故丢失了它，导致全仓语法错误无法构建）：此时再调 provider 只会经
+      // resolveAudio 把整套拉取重跑一遍（白付一次 ffmpeg/下载），且其通用错误文案
+      // 「无法取得音频文件」会被确定性正则误判 → 一次网络抖动变成
+      // 「无转写 + 台账记已处理 + 永不重试」。直接按素材错误分类。
+      summary.asrFailed++;
+      if (isDeterministicMediaError(mediaErrorKind)) {
+        this.clearAsrRetry(item.id);
+        summary.errors.push(`转写失败（素材侧，不重试）：${mediaPullError.slice(0, 70)}`);
+      } else {
+        this.enqueueAsrRetry(item.id, mediaPullError || mediaErrorKind);
+      }
+      return null;
+    }
+    // 音频路拉取的错误类别（复审 P1）：provider 失败时按结构化类别分类，不再依赖其
+    // 通用错误文案撞确定性正则（网络抖动会被误杀成「永不重试」）
+    let audioPullKind: MediaErrorKind | null = null;
+    const provider = createAsrProvider(this.settings, this.client, {
+      resolveAudio: async (url, videoId, durationSec) => {
+        const pulled = await this.videoMedia.pullAssets(
+          { id: videoId || item.id, playUrl: url, durationSec: durationSec ?? item.durationSec },
+          { wantAudio: true, wantFrames: false },
+        );
+        audioPullKind = pulled.assets ? (pulled.assets.audioPath ? "none" : "no_audio") : pulled.errorKind;
+        return pulled.assets?.audioPath || null;
+      },
+    });
+    if (provider && item.playUrl) {
+      if (this.asrBudgetLeft <= 0) {
+        // 转写预算接线（第四轮声明、第六轮补实现）：maxTranscribePerSync 此前只约束重试队列，
+        // 全新条目的转写完全不受限——首次全量同步会一次性烧掉几百条转写费。预算耗尽后
+        // 新条目顺延到下次同步续传（不记失败、不进退避，attempts=0 下轮立即可试）。
+        this.deferAsrToNextSync(item.id);
+        return null;
+      }
+      this.asrBudgetLeft--;
+      const asr = await provider.transcribe(item.playUrl, item.id, { durationSec: item.durationSec });
+      if (asr.status === "success") {
+        summary.transcribed++;
+        // B3（第九轮）：已付费的转录先暂存再往下走——后续写笔记失败时条目不进台账，
+        // 原实现转录文本只存在内存、下轮按全新条目重新计费
+        this.stashTranscript(item.id, asr);
+      } else if (asr.status === "unavailable") {
+        // 已调通接口、确认无可转写内容（纯音乐/无对白）→ 移出队列，不反复重试
+        summary.asrFailed++;
+        this.clearAsrRetry(item.id);
+      } else {
+        summary.asrFailed++;
+        const kind = audioPullKind && audioPullKind !== "none" ? audioPullKind : mediaErrorKind;
+        if (
+          isDeterministicMediaError(kind) ||
+          (kind === "none" && DETERMINISTIC_ASR_FAILURE_RE.test(asr.error ?? ""))
+        ) {
+          // 素材侧失败是确定性的：重试必然复现同一结果，不入队（P2）
+          this.clearAsrRetry(item.id);
+          summary.errors.push(`转写失败（素材侧，不重试）：${(asr.error ?? "").slice(0, 70)}`);
+        } else {
+          this.enqueueAsrRetry(item.id, asr.error ?? asr.status);
+        }
+      }
+      return asr;
+    }
+    if (!item.playUrl) {
+      return { status: "unavailable", transcript: "", error: "无播放地址" };
+    }
+    return null;
+  }
+
+  /** 阶段 7：AI 分类。重试路径复用既有分类；分类失败不中断条目（记入 errors，落「未分类」）。 */
+  private async categorizeItem(
+    item: SyncItem,
+    reused: ReusedNoteAssets | null,
+    asr: AsrResult | null,
+    summary: SyncSummary,
+  ): Promise<string> {
+    if (reused?.category) return reused.category;
+    if (!(this.settings.enableCategory && this.ai)) return "未分类";
+    const cats = parseList(this.settings.aiCategories);
+    if (cats.length === 0) return "未分类";
+    try {
+      return await this.ai.categorize(cats, item.title, item.desc, asr?.transcript ?? "");
+    } catch (e: any) {
+      summary.errors.push(`分类失败：${String(e?.message ?? e).slice(0, 80)}`);
+      return "未分类";
+    }
+  }
+
+  /**
+   * 阶段 8：写笔记（buildNote 全量内容 → writeNoteFile → 既有摘要回填）。
+   * 回填是关键修复：重建笔记会清掉既有摘要（buildNote 不含摘要块/frontmatter summary），
+   * 先按既有摘要回填，保证「摘要重生成失败」不会把已有摘要永久抹掉；生成成功时再被覆盖。
+   * 2026-09-27：改单次 vault.process 原子写（frontmatter + 摘要块一次变换完成），
+   * 消除「processFrontMatter 写 → 再 read → 再 modify」三遍全文件 IO 与两次写之间的覆盖竞态。
+   */
+  private async writeItemNote(input: NoteWriteInput): Promise<{ path: string; noteFile: TFile | null }> {
+    const { item, folder, overwritePath, reused, category, coverPath, imagesDownloaded, visionTexts, asr, assets } =
+      input;
+    const title = noteTitleFor(item.title, item.id);
+    const path = overwritePath ?? planNotePath(this.settings.rootFolder, item, folder, title);
+    const content = buildNote({
+      item,
+      folder,
+      category,
+      coverPath,
+      imagesDownloaded,
+      visionTexts,
+      asr,
+      framePaths: assets?.framePaths ?? [],
+      // 只在真的有帧时写 frame_interval（复审 P2）：部分成功（帧缺席）也写间隔的话，
+      // 补跑 framesOk 判定会误判「帧已达标」，这类笔记从此永远不再补抽帧。
+      // 值用「本次帧的真实间隔」（第九轮 A1）：复用帧时原样回写笔记记录的间隔，
+      // 保持补跑 framesOk 判定自洽——原实现盖当前设置值，把「间隔已变、需重抽」状态永久抹掉
+      keyframeIntervalSec:
+        assets && assets.framePaths.length > 0
+          ? Math.max(1, Math.min(60, input.frameIntervalSec || this.settings.keyframeIntervalSec || 10))
+          : 0,
+      syncedAt: nowIso(),
+    });
+    // F3（第十轮）：既有摘要回填合并进同一次落盘。原「覆盖写 → 再 vault.process 回填」两段
+    // 之间崩溃的话，磁盘旧摘要已被抹掉、仅存内存（reused.summaryText）——视频笔记可靠补跑
+    // 自愈，图文笔记没有自动摘要通道、摘要永久丢失。summaryText 写前已在手，内存合并零成本。
+    let finalContent = content;
+    if (reused?.summaryText) {
+      // 回填失败不影响主流程（保持原两段写的容错语义：宁可丢摘要回填，不炸整条）
+      try {
+        const v = parseInt(reused.summaryV, 10);
+        // 版本号解析失败时传 undefined（第六轮修）：捏造 v3 会让 v1/v2 旧摘要被标成 v3，
+        // 补跑判定恒真、旧格式摘要永远不再按新格式重出
+        finalContent = applySummaryToNote(content, reused.summaryText, Number.isFinite(v) && v > 0 ? v : undefined);
+      } catch {
+        finalContent = content;
+      }
+    }
+    const noteFile = await this.writeNoteFile(path, finalContent, overwritePath);
+    return { path, noteFile };
+  }
+
+  /**
+   * 阶段 9：视频多模态综合总结（自动；图文类不走此分支）：转录文字 + 关键帧 → 视觉模型。
+   * 生成门与拉帧门同源（第六轮接线，第四轮只改了 needFrames 一半）：专用通道用户
+   * 此前「照付抽帧成本但摘要静默不跑」，且补跑候选判定永假、每轮重复补跑。
+   */
+  private async runVideoSummary(
+    item: SyncItem,
+    noteFile: TFile | null,
+    asr: AsrResult | null,
+    assets: VideoAssets | null,
+    summary: SyncSummary,
+    keepExistingSummary = false,
+  ): Promise<void> {
+    // F2（第十轮）：撞库恢复且笔记已有当前版本摘要 → 整个阶段跳过。放在 settings 门之前：
+    // 即使摘要通道可用，用现生成版本覆盖回填好的精修摘要也是净损失（付费 + 质量不可控）。
+    if (keepExistingSummary) return;
+    // 配额熔断（第十三轮）：配额类失败连续 3 次后跳过本阶段——每条白打一次 403 且逐条刷 error
+    if (this.videoSummaryQuotaDead) return;
+    if (
+      !(
+        item.type === "video" &&
+        this.settings.videoSummaryEnabled &&
+        !!resolveVideoSummaryChannel(this.settings).apiKey &&
+        noteFile
+      )
+    ) {
+      return;
+    }
+    try {
+      const r = await generateAndWriteVideoSummary(this.app, noteFile, this.settings, {
+        title: item.title,
+        desc: item.desc,
+        transcript: asr?.transcript ?? "",
+        framePaths: assets?.framePaths ?? [],
+      });
+      if (r.record) this.state.summary = pushSummaryRecord(this.state.summary, r.record);
+      if (r.ok) {
+        this.videoSummaryQuotaFails = 0;
+        summary.videoSummaries++;
+      } else {
+        const failMsg = r.msg ?? "";
+        if (isQuotaExhaustedError(failMsg)) {
+          // 09-21 真实数据：配额耗尽后 50 连发同错误（summary records 全红）。3 次即熔断——
+          // 抑制后续条目的摘要调用与帧路拉取（needFrames），一次 notice 说明，不再逐条报错
+          if (++this.videoSummaryQuotaFails >= 3 && !this.videoSummaryQuotaDead) {
+            this.videoSummaryQuotaDead = true;
+            summary.notices.push("多模态通道配额疑似耗尽（连续 3 次失败），本次运行剩余视频跳过摘要与抽帧；额度恢复后下轮自动恢复");
+          }
+        }
+        summary.errors.push(`[${item.id}] 视频摘要：${r.msg.slice(0, 100)}`);
+      }
+    } catch (e: any) {
+      summary.errors.push(`[${item.id}] 视频摘要异常：${String(e?.message ?? e).slice(0, 80)}`);
+    }
+  }
+
+  /** 台账收尾：processed 记录 + 反向索引 + 转写成功/确认无语音时结清重试台账。 */
+  private finalizeProcessed(item: SyncItem, path: string, folder: string, asr: AsrResult | null): void {
+    this.state.processed[item.id] = {
+      path,
+      syncedAt: nowIso(),
+      folder: folder || SOURCE_LABEL[item.source],
+      asrStatus: asr?.status,
+      // 来源入台账（第四轮声明、第六轮接线）：重试/补跑重建时还原 frontmatter source，
+      // 不再把点赞/作品笔记改写成「收藏」
+      source: item.source,
+    };
+    this.noteIndexGet().set(item.id, path); // 反向索引同步更新（问题 8）
+    if (asr?.status === "success" || asr?.status === "unavailable") {
+      this.clearAsrRetry(item.id);
+    }
+    // B3（第九轮）：条目已成功落账，转写暂存使命完成
+    if (this.state.transcriptCache) delete this.state.transcriptCache[item.id];
+  }
+
+  // ---------- 相关笔记互链（2026-09-27 第八轮，借鉴 Learning-Vault-Skills） ----------
+
+  /**
+   * 阶段 10：给刚写好的笔记挂「相关笔记」块（同分类/同作者），并让被链笔记回链本条。
+   * 候选一次收集、全链路复用（本条 + ≤N 条回链都从同一份候选集计算，保证互链一致）；
+   * 块写入是幂等 upsert（relatedNotes.applyRelatedToNote），重复同步不产生重复块。
+   * 任何失败只放弃互链，不影响同步主流程。
+   */
+  private async linkRelatedNotes(item: SyncItem, noteFile: TFile | null, category: string): Promise<void> {
+    if (!this.settings.relatedNotesEnabled || !noteFile) return;
+    try {
+      const candidates = this.collectRelatedCandidates();
+      // metadataCache 索引新建文件有延迟：把本条手工补进候选集，保证被链笔记的回链即时建立
+      // 而不必等下一次重建；若缓存里已有（重同步路径）按 path 去重覆盖为内存里的最新分类/作者
+      const selfEntry: RelatedCandidate = {
+        path: noteFile.path,
+        id: item.id,
+        category,
+        author: item.author,
+        title: noteTitleFor(item.title, item.id),
+        likes: item.stats?.likes ?? 0,
+      };
+      const selfIdx = candidates.findIndex((c) => c.path === selfEntry.path || c.id === selfEntry.id);
+      if (selfIdx >= 0) candidates[selfIdx] = selfEntry;
+      else candidates.push(selfEntry);
+
+      const links = await this.writeRelatedBlock(noteFile, { id: item.id, category, author: item.author }, candidates);
+      for (const lk of links) {
+        // 互链：被链笔记重算自己的相关列表（候选集已含本条新笔记），回链自动建立
+        const f = this.app.vault.getAbstractFileByPath(normalizePath(lk.path));
+        const cand = candidates.find((c) => c.path === lk.path);
+        if (f instanceof TFile && cand) {
+          await this.writeRelatedBlock(f, { id: cand.id, category: cand.category, author: cand.author }, candidates);
+        }
+      }
+    } catch {
+      /* 互链失败不影响主流程 */
+    }
+  }
+
+  /**
+   * 从 metadataCache 收集互链候选（rootFolder 之下、有 douyin_id frontmatter 的 markdown）。
+   * 纯内存查询（Obsidian 已解析好 frontmatter），O(vault 文件数) 毫秒级；
+   * metadataCache / getMarkdownFiles 不可用（极端宿主环境、测试替身未提供）时返回空集，
+   * 互链整体静默跳过——候选为空时 writeRelatedBlock 也不会留空块。
+   */
+  private collectRelatedCandidates(): RelatedCandidate[] {
+    try {
+      const cache = (this.app as any).metadataCache;
+      const files = this.app.vault.getMarkdownFiles?.();
+      if (!cache || typeof cache.getFileCache !== "function" || !Array.isArray(files)) return [];
+      const root = normalizePath(this.settings.rootFolder || "").replace(/\/+$/, "");
+      const out: RelatedCandidate[] = [];
+      for (const f of files) {
+        if (root && f.path !== root && !f.path.startsWith(root + "/")) continue;
+        const fm = cache.getFileCache(f)?.frontmatter;
+        if (!fm) continue;
+        const id = typeof fm.douyin_id === "string" ? fm.douyin_id : String(fm.douyin_id ?? "");
+        if (!id) continue;
+        out.push({
+          path: f.path,
+          id,
+          category: typeof fm.category === "string" ? fm.category : "",
+          author: typeof fm.author === "string" ? fm.author : "",
+          title: typeof fm.title === "string" && fm.title.trim() ? fm.title : f.basename,
+          likes: Number(fm.likes) || 0,
+        });
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  /** 对单个文件幂等写入「相关笔记」块；返回本次实际互链的条目（供互链回写）。 */
+  private async writeRelatedBlock(
+    file: TFile,
+    self: { id: string; category: string; author: string },
+    candidates: RelatedCandidate[],
+  ): Promise<RelatedLink[]> {
+    const links = pickRelatedLinks(
+      { ...self, path: file.path, title: "", likes: 0 },
+      candidates,
+      Math.max(1, Math.min(30, this.settings.relatedNotesMax || 8)),
+    );
+    const block = buildRelatedBlock(links);
+    // 无变化不写盘（第九轮 A4，与 refreshAllRelatedNotes 同口径）：内容不变时 vault.process
+    // 也会重写文件、mtime 每轮跳动，污染「最近7天」视图与同步/备份工具的变更检测
+    let cur: string | null = null;
+    try {
+      cur = await this.app.vault.read(file);
+    } catch {
+      cur = null; // 读取失败按「有变化」处理，走 process 兜底（原行为）
+    }
+    if (cur !== null && applyRelatedToNote(cur, block) === cur) return links;
+    await this.app.vault.process(file, (data) => applyRelatedToNote(data, block));
+    return links;
+  }
+
+  /**
+   * 重建全部相关笔记链接（命令/设置页入口）：全量候选 × 全量笔记重算互链块，
+   * 内容无变化的文件不写盘。返回扫描与更新篇数供 Notice 反馈。
+   */
+  async refreshAllRelatedNotes(): Promise<{ scanned: number; updated: number }> {
+    // 守卫（第九轮 A12）：互链开关关闭时不写库（命令入口另有明确提示）；同步进行中拒绝并发写
+    if (this.running) throw new Error("同步正在进行中");
+    if (!this.settings.relatedNotesEnabled) return { scanned: 0, updated: 0 };
+    // F6（第十轮）：重建期间置位 running——原实现只查不置，双击重建命令会并发跑两轮全库
+    // 扫描写盘，重建进行中也能启动 syncAll/backfill 与之交错。与 backfillVideos 同款 finally 复位。
+    this.running = true;
+    try {
+      const candidates = this.collectRelatedCandidates();
+      let updated = 0;
+      for (const cand of candidates) {
+        const f = this.app.vault.getAbstractFileByPath(normalizePath(cand.path));
+        if (!(f instanceof TFile)) continue;
+        const block = buildRelatedBlock(
+          pickRelatedLinks(cand, candidates, Math.max(1, Math.min(30, this.settings.relatedNotesMax || 8))),
+        );
+        let cur: string;
+        try {
+          cur = await this.app.vault.read(f);
+        } catch {
+          continue;
+        }
+        if (applyRelatedToNote(cur, block) === cur) continue; // 无变化不写盘（mtime 不动）
+        await this.app.vault.process(f, (data) => applyRelatedToNote(data, block));
+        updated++;
+      }
+      return { scanned: candidates.length, updated };
+    } finally {
+      this.running = false;
     }
   }
 
@@ -847,7 +1515,28 @@ export class SyncEngine {
         if (!found || (found.includes("未分类") && !f.path.includes("未分类"))) found = f.path;
       }
     }
-    if (found) this.noteIndexGet().set(id, found);
+    if (found) {
+      this.noteIndexGet().set(id, found);
+      return found;
+    }
+    // ③ douyin_id frontmatter 兜底（第九轮 A6 配套）：文件被用户改名后文件名后缀失配，
+    // 仍能按 frontmatter 定位——否则重试路径会误判「已删除」而结清重试队列。
+    // metadataCache 不可用（测试替身/极端宿主）时跳过，按未找到处理。
+    try {
+      const cache = (this.app as any).metadataCache;
+      const files = this.app.vault.getMarkdownFiles?.();
+      if (cache && typeof cache.getFileCache === "function" && Array.isArray(files)) {
+        for (const f of files) {
+          const fm = cache.getFileCache(f)?.frontmatter;
+          if (fm && String(fm.douyin_id ?? "") === id) {
+            this.noteIndexGet().set(id, f.path);
+            return f.path;
+          }
+        }
+      }
+    } catch {
+      /* 缓存不可用时按未找到处理 */
+    }
     return found;
   }
 
@@ -856,17 +1545,23 @@ export class SyncEngine {
     try {
       const file = this.app.vault.getAbstractFileByPath(path);
       if (!(file instanceof TFile)) return;
-      const s = await this.app.vault.read(file);
-      const idx = s.indexOf("> [!warning]- 逐字稿");
-      if (idx < 0) return; // 已是成功/其他状态，不动
-      const ends = [s.indexOf("\n\n", idx), s.indexOf("\n---", idx)].filter((x) => x > 0);
-      const end = ends.length ? Math.min(...ends) : s.length;
-      const block = [
-        "> [!warning]- 逐字稿",
-        `> 转写未成功：${error.replace(/^>+\s*/g, "").slice(0, 300)}`,
-        "> 可用命令「重试失败转写」重试。",
-      ].join("\n");
-      await this.app.vault.modify(file, s.slice(0, idx) + block + s.slice(end));
+      // 错误文本压成一行（第九轮 A7）：多行错误直接嵌入会让后续行失去 `>` 前缀，
+      // callout 结构与块尾判定（\n\n / \n---）都被扰动
+      const text = error.replace(/\r?\n/g, " ").replace(/^>+\s*/, "").slice(0, 300);
+      // vault.process 原子读改写（第九轮 B8）：原 read→modify 两段式在 await 窗口内
+      // 会用陈旧快照覆盖用户编辑，与全仓其他写点的口径一致化
+      await this.app.vault.process(file, (cur) => {
+        const idx = cur.indexOf("> [!warning]- 逐字稿");
+        if (idx < 0) return cur; // 已是成功/其他状态，不动
+        const ends = [cur.indexOf("\n\n", idx), cur.indexOf("\n---", idx)].filter((x) => x > 0);
+        const end = ends.length ? Math.min(...ends) : cur.length;
+        const block = [
+          "> [!warning]- 逐字稿",
+          `> 转写未成功：${text}`,
+          "> 可用命令「重试失败转写」重试。",
+        ].join("\n");
+        return cur.slice(0, idx) + block + cur.slice(end);
+      });
     } catch {
       // 回写失败不影响主流程
     }
@@ -908,6 +1603,60 @@ export class SyncEngine {
     if (this.state.asrRetry) delete this.state.asrRetry[id];
   }
 
+  /** 预算顺延（第四轮声明、第六轮补实现）：转写预算耗尽时把新条目排进下次同步，不计失败不进退避。 */
+  private deferAsrToNextSync(id: string): void {
+    if (!this.state.pendingAsr.includes(id)) this.state.pendingAsr.push(id);
+    if (!this.state.asrRetry) this.state.asrRetry = {};
+    if (!this.state.asrRetry[id]) {
+      this.state.asrRetry[id] = {
+        attempts: 0,
+        lastError: "转写预算耗尽，顺延到下次同步",
+        nextRetryAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  // ---------- 转写结果暂存（第九轮 B3：防「转写成功但写笔记失败」重复计费） ----------
+
+  /** 转写成功即暂存（FIFO ≤20 条防 data.json 膨胀）；写笔记成功后由 finalizeProcessed 清除。 */
+  private stashTranscript(id: string, asr: AsrResult): void {
+    if (!asr.transcript) return;
+    const c = (this.state.transcriptCache ??= {});
+    c[id] = { transcript: asr.transcript, provider: asr.provider ?? "", at: nowIso() };
+    const keys = Object.keys(c);
+    if (keys.length > 20) {
+      keys.sort((a, b) => (Date.parse(c[a].at) || 0) - (Date.parse(c[b].at) || 0));
+      for (const k of keys.slice(0, keys.length - 20)) delete c[k];
+    }
+  }
+
+  /** 查暂存（只窥不取：写笔记成功才算消耗，失败保留下轮再用）。
+   *  F7（第十轮）：供应商不匹配的暂存视为过期并删除——用户切换 ASR 供应商（如对旧供应商
+   *  转录质量不满）后期望按新供应商重转，暂存抢先落账会让该条目永不重转（连重置台账都
+   *  绕不开，resetState 保留暂存）。宁可重付一次转录费，不交付违背当前配置的结果。
+   *  provider 名与 settings.asrProvider 同名；dashscope_qwen3 的成功结果用子模型名（qwen3-*），
+   *  按前缀识别。provider 为空（loadState 消毒前的旧数据）按不匹配处理。 */
+  private peekStashedTranscript(id: string): AsrResult | null {
+    const e = this.state.transcriptCache?.[id];
+    if (!e?.transcript) return null;
+    const want = this.settings.asrProvider;
+    const got = e.provider;
+    // 第十轮复审批：paraformer 通道的成功结果 provider 是子模型名（"paraformer-v2" /
+    // 兜底 "fun-asr-mtl"，见 asr/dashscope.ts collectResult 的 provider: model ?? this.name），
+    // 与 want="dashscope_paraformer" 严格不等——缺这条前缀规则的话，B3 暂存保护对该通道
+    // 整体失效（暂存条目每次被 F7 判不匹配删除、下轮重新计费，恰是 F7 要防的对侧）。
+    const providerMatched =
+      !!got &&
+      (got === want ||
+        (want === "dashscope_qwen3" && /^qwen3/i.test(got)) ||
+        (want === "dashscope_paraformer" && /^(paraformer|fun-asr)/i.test(got)));
+    if (!providerMatched) {
+      delete this.state.transcriptCache![id];
+      return null;
+    }
+    return { status: "success", transcript: e.transcript, provider: got || "cached" };
+  }
+
   /** 当前是否允许重试：已 dead 或未到退避时间点则跳过。 */
   private asrRetryReady(id: string): boolean {
     const e = this.state.asrRetry?.[id];
@@ -928,7 +1677,7 @@ export class SyncEngine {
     if (deadCount > 0) {
       summary.errors.push(`转写重试：${deadCount} 条已失败 ${ASR_RETRY_MAX} 次，放弃自动重试（见 state.asrRetry）`);
     }
-    if (deferred > 0) summary.errors.push(`转写重试：${deferred} 条未到退避时间，本次跳过`);
+    if (deferred > 0) summary.notices.push(`转写重试：${deferred} 条未到退避时间，本次跳过`);
     for (const id of ids) {
       const entry = this.state.processed[id];
       if (!entry || !entry.path) {
@@ -936,7 +1685,18 @@ export class SyncEngine {
         continue;
       }
       // entry.path 可能因外部移动（如分类回填）过期，按 ID 现场定位，避免在旧路径重建出重复笔记
-      const currentPath = this.findNotePath(id) ?? entry.path;
+      const located = this.findNotePath(id);
+      if (!located) {
+        const oldFile = this.app.vault.getAbstractFileByPath(normalizePath(entry.path));
+        if (!(oldFile instanceof TFile)) {
+          // 笔记已被用户删除（第九轮 A6）：尊重删除——结清重试队列但不再重建复活；
+          // 保留 processed 台账，否则下轮同步会把它当新条目重建，删了又回来
+          this.clearAsrRetry(id);
+          this.markStateDirty();
+          continue;
+        }
+      }
+      const currentPath = located ?? entry.path;
       notice.setMessage(`抖音同步：重试转写 ${id}`);
       try {
         const raw = await this.client.getAwemeDetail(id);
@@ -946,7 +1706,8 @@ export class SyncEngine {
           this.markStateDirty();
           continue;
         }
-        const item = DouyinClient.normalize(raw, "collection");
+        // 来源还原（第四轮声明、第六轮接线）：按台账记录的来源重建，不再硬编码 collection
+        const item = DouyinClient.normalize(raw, entry.source ?? "collection");
         if (!item) {
           this.clearAsrRetry(id); // 作品已不可解析（被删除 / 权限变更）→ 不再重试
           this.markStateDirty();
@@ -960,41 +1721,70 @@ export class SyncEngine {
         if (isAudioOnlyItem(item)) {
           // 无视频轨条目（aweme_type=163）：重试也拿不到视频轨，只会转出 BGM。
           // 改写笔记为「未转写」并结清台账 —— 这 5 条曾在此处无限空转（attempts 2~3 → dead）。
-          await this.processItem(item, entry.folder, summary, notice, currentPath, {
+          const ok = await this.processItem(item, entry.folder, summary, notice, currentPath, {
             status: "unavailable",
             transcript: "",
             provider: "none",
             error: AUDIO_ONLY_REASON,
           });
-          this.state.processed[id].asrStatus = "unavailable";
-          this.state.processed[id].path = currentPath;
-          this.clearAsrRetry(id);
-          summary.asrSkipped++;
+          if (ok) {
+            this.state.processed[id].asrStatus = "unavailable";
+            this.state.processed[id].path = currentPath;
+            this.clearAsrRetry(id);
+            summary.asrSkipped++;
+          } else {
+            // 笔记写入失败（复审 P2）：不能照常结清，否则该条目带着旧台账永离重试队列
+            this.bumpAsrRetry(id, "音频类条目笔记写入失败");
+          }
           this.markStateDirty();
           budget--;
           await sleep(300);
           continue;
         }
-        const provider = createAsrProvider(this.settings, this.client, {
-          resolveAudio: (url, videoId, durationSec) =>
-            this.videoMedia.getAudio(videoId ?? "", url, durationSec ?? item.durationSec),
-        });
-        if (!provider) continue;
-        const asr = await provider.transcribe(item.playUrl, item.id, { durationSec: item.durationSec });
+        // B3（第九轮）：转写结果暂存命中 → 不再调 provider 重新计费，直接复用上次已付费的转录
+        const stashed = this.peekStashedTranscript(id);
+        let provider: ReturnType<typeof createAsrProvider> = null;
+        if (!stashed) {
+          provider = createAsrProvider(this.settings, this.client, {
+            resolveAudio: (url, videoId, durationSec) =>
+              this.videoMedia.getAudio(videoId ?? "", url, durationSec ?? item.durationSec),
+          });
+          if (!provider) {
+            // 配置不全不再静默空转（第六轮，复审遗留）：原实现每次同步选中该条目却什么都不做，
+            // 条目永久占据队列且用户无感知。记一次退避并写明原因，到上限转 dead-letter 有据可查。
+            this.bumpAsrRetry(id, `ASR 配置不全（provider=${this.settings.asrProvider}，请检查设置页密钥）`);
+            this.markStateDirty();
+            continue;
+          }
+        }
+        const asr = stashed ?? (await provider!.transcribe(item.playUrl, item.id, { durationSec: item.durationSec }));
         if (asr.status === "success") {
-          summary.transcribed++;
+          if (!stashed) {
+            summary.transcribed++;
+            this.stashTranscript(id, asr);
+          }
           // 重新生成笔记（按定位到的当前路径；复用已得转写，不再二次转写）
-          await this.processItem(item, entry.folder, summary, notice, currentPath, asr);
-          this.state.processed[id].asrStatus = "success";
-          this.state.processed[id].path = currentPath;
-          this.clearAsrRetry(id);
+          const ok = await this.processItem(item, entry.folder, summary, notice, currentPath, asr);
+          if (ok) {
+            this.state.processed[id].asrStatus = "success";
+            this.state.processed[id].path = currentPath;
+            this.clearAsrRetry(id);
+          } else {
+            // 笔记写入失败（复审 P2）：已付费的转写结果没落进笔记时不能谎报成功并结清台账，
+            // 否则该条目永离重试队列（笔记停留旧状态、转写费白花）；保住条目下轮再试
+            this.bumpAsrRetry(id, "转写成功但笔记写入失败");
+          }
           this.markStateDirty();
         } else if (asr.status === "unavailable") {
           // 无可转写内容（纯音乐/无对白等）——重写笔记说明并移出队列，不再反复重试
-          await this.processItem(item, entry.folder, summary, notice, currentPath, asr);
-          this.state.processed[id].asrStatus = "unavailable";
-          this.state.processed[id].path = currentPath;
-          this.clearAsrRetry(id);
+          const ok = await this.processItem(item, entry.folder, summary, notice, currentPath, asr);
+          if (ok) {
+            this.state.processed[id].asrStatus = "unavailable";
+            this.state.processed[id].path = currentPath;
+            this.clearAsrRetry(id);
+          } else {
+            this.bumpAsrRetry(id, "确认无可转写内容但笔记写入失败");
+          }
           this.markStateDirty();
           summary.asrFailed++;
         } else {
@@ -1003,6 +1793,9 @@ export class SyncEngine {
           this.bumpAsrRetry(id, asr.error ?? "未知错误");
           // 把真实失败原因回写进笔记的逐字稿区块，便于排查（成功路径由 processItem 全量重写）
           await this.writeAsrErrorNote(currentPath, asr.error ?? "未知错误");
+          // 清掉本次尝试的素材缓存（复审 P2）：失败路径不走 processItem 的无条件 cleanup，
+          // 毒化缓存会让下一次重试的 getAudio 秒失败，重试命令对该条目形同空转
+          this.videoMedia.cleanup(id);
           this.markStateDirty();
         }
         budget--;
@@ -1010,6 +1803,7 @@ export class SyncEngine {
       } catch (e: any) {
         summary.errors.push(`重试转写 ${id}：${String(e?.message ?? e).slice(0, 80)}`);
         this.bumpAsrRetry(id, String(e?.message ?? e));
+        this.videoMedia.cleanup(id);
         this.markStateDirty();
       }
     }
@@ -1030,7 +1824,14 @@ export class SyncEngine {
     const summary = newSyncSummary();
     try {
       this.refreshClients(); // 同 syncAll：按最新设置重建 AI 客户端
-      const budget = Math.max(1, this.settings.maxTranscribePerSync);
+      // 配额熔断复位（每轮重新探测，见字段注释）
+      this.videoSummaryQuotaFails = 0;
+      this.videoSummaryQuotaDead = false;
+      // 转写预算语义与同步路径对齐（第九轮 A11）：0 = 不再转写（原 Math.max(1,…) 会让
+      // 「用户设 0 禁用转写」的意图在补跑里照样白转 1 条）。预算 0 时只补「可复用已有转录」
+      // 的候选（摘要/帧工作，零 ASR 计费），上限 50 条防一次点击跑完全库。
+      const budget = Math.max(0, this.settings.maxTranscribePerSync);
+      const REUSE_ONLY_CAP = 50;
     const wantInterval = Math.max(1, Math.min(60, this.settings.keyframeIntervalSec || 10));
     let done = 0;
     let skipped = 0;
@@ -1043,14 +1844,20 @@ export class SyncEngine {
       id: string;
       currentPath: string;
       folder: string;
+      source?: ItemSource;
       asrOverride?: AsrResult;
       frameHint?: string[];
+      /** 帧网格未达标（间隔改过 / 从未抽出）→ 明确重抽意图，禁止 reused 帧劫持（第九轮 A1） */
+      reextract?: boolean;
     }
     const jobs: BackfillJob[] = [];
     for (const id of Object.keys(this.state.processed)) {
-      if (jobs.length >= budget) break;
+      if (budget > 0 && jobs.length >= budget) break;
       const entry = this.state.processed[id];
-      // entry.path 可能因外部移动（如分类回填）过期，按 ID 现场定位
+      // 补跑连续失败 ≥3 次的条目本轮直接跳过（第四轮声明、第六轮接线）：候选按台账插入序取前
+      // budget 个，队首固定是最早一批——CDN 已失效的条目每次补跑都占据名额（每次 = 一次全片下载），
+      // 尾部健康笔记永远轮不到；成功即清除计数，给过去失败过的条目留恢复通道
+      if ((this.state.backfillFails?.[id] ?? 0) >= 3) continue;
       const currentPath = this.findNotePath(id) ?? entry?.path;
       if (!currentPath) continue;
       const file = this.app.vault.getAbstractFileByPath(normalizePath(currentPath));
@@ -1061,22 +1868,26 @@ export class SyncEngine {
       } catch {
         continue;
       }
-      // type 判断必须引号无关：processFrontMatter 写回 summary 后会把 YAML 里的引号去掉（type: 视频）
-      if (!/^type:\s*"?(视频)"?\s*$/m.test(content)) continue; // 只补跑视频类；图文类维持原逻辑
-      const transcriptOk = /^transcript_status:\s*"?success"?/m.test(content);
+      // type 判断必须引号无关：processFrontMatter 写回 summary 后会把 YAML 里的引号去掉（type: 视频）。
+      // 判定一律先切 frontmatter 区间（2026-09-27 修）：整篇 /m 匹配时正文同名行（逐字稿/OCR 文本）会劫持分支
+      const fm = frontmatterBlock(content);
+      if (!/^type:\s*"?(视频)"?\s*$/m.test(fm)) continue; // 只补跑视频类；图文类维持原逻辑
+      const transcriptOk = /^transcript_status:\s*"?success"?/m.test(fm);
       // 终态（success / unavailable / not_requested）都不该再补跑：unavailable 是「已确认无可转写内容」，
       // 不纳入终态会让这些笔记每次补跑都被重写一遍（2026-09-21 修）。
-      const transcriptTerminal = /^transcript_status:\s*"?(success|unavailable|not_requested)"?/m.test(content);
-      const hasSummary = content.includes("> [!abstract]- 摘要");
+      const transcriptTerminal = /^transcript_status:\s*"?(success|unavailable|not_requested)"?/m.test(fm);
+      // 所有权判定与 statusCore 整行全等口径一致（第六轮）：裸 includes 会被用户自建的
+      // 同名 callout 或正文引用行误命中，让缺摘要的笔记被判定「已有摘要」跳过补跑
+      const hasSummary = /^> \[!abstract\]- 摘要\s*$/m.test(content);
       // 抽帧按间隔自适应：间隔设置变过、或从未抽出帧（纯音乐/拉取失败）→ 重抽；
       // ingestFrames 会清掉旧网格多余帧。摘要按 summary_v 版本号判断（v3 = 层级笔记体），格式升级会重出。
       // 无帧笔记：若已按当前间隔尝试过抽帧（storedInterval>0）仍无帧（纯音乐/音频流/直链失效），
       // 视为已完成，避免每次补跑都重复拉视频+重出摘要。
       const framePaths = listVideoFramePaths(this.app.vault, this.settings.mediaFolder, id);
-      const storedInterval = parseInt((content.match(/^frame_interval:\s*(\d+)\s*$/m) ?? [])[1] ?? "0", 10) || 0;
+      const storedInterval = parseInt((fm.match(/^frame_interval:\s*(\d+)\s*$/m) ?? [])[1] ?? "0", 10) || 0;
       const framesOk =
         (framePaths.length > 0 || storedInterval > 0) && storedInterval === wantInterval;
-      const summaryV3 = /^summary_v:\s*3\s*$/m.test(content);
+      const summaryV3 = /^summary_v:\s*3\s*$/m.test(fm);
       if (transcriptTerminal && hasSummary && framesOk && summaryV3) {
         skipped++;
         continue;
@@ -1084,12 +1895,29 @@ export class SyncEngine {
       // 转录已成功时复用笔记里的逐字稿（不重复计费 ASR）；帧网格已达标时复用已入库帧，跳过视频重新拉取
       let asrOverride: AsrResult | undefined;
       if (transcriptOk) {
-        const provider = (content.match(/^transcript_provider:\s*"?([^"\n]*)"?\s*$/m) ?? [])[1] ?? "";
+        const providerName = (fm.match(/^transcript_provider:\s*"?([^"\n]*)"?\s*$/m) ?? [])[1] ?? "";
         const transcript = extractSummarySources(content).transcript;
-        asrOverride = { status: "success", transcript, provider: provider || "reused" };
+        // 逐字稿为空时不再盖章 success（第九轮 A8）：frontmatter success + 正文空块的自相矛盾
+        // 会让补跑终态判定恒真、矛盾永久化——回退 undefined 走正常转写流程自愈
+        if (transcript.trim()) {
+          asrOverride = { status: "success", transcript, provider: providerName || "reused" };
+        }
       }
       const frameHint = framesOk && this.settings.videoSummaryEnabled ? framePaths : undefined;
-      jobs.push({ id, currentPath, folder: entry.folder || "", asrOverride, frameHint });
+      // 预算 0（禁用转写）时只保留「可复用已有转录」的免费候选（第九轮 A11）
+      if (budget <= 0) {
+        if (!asrOverride) continue;
+        if (jobs.length >= REUSE_ONLY_CAP) break;
+      }
+      jobs.push({
+        id,
+        currentPath,
+        folder: entry.folder || "",
+        source: entry.source,
+        asrOverride,
+        frameHint,
+        reextract: !framesOk,
+      });
     }
 
     // ---- 阶段二：限并发补跑（性能治理 P0-3）----
@@ -1100,8 +1928,11 @@ export class SyncEngine {
       started++;
       onProgress?.(`补跑视频 ${job.id}（已启动 ${started}/${jobs.length}）`);
       try {
-        const raw = await this.client.getAwemeDetail(job.id);
-        const item = raw ? DouyinClient.normalize(raw, "collection") : null;
+        // 详情请求过串行闸门（第四轮声明、第六轮接线）：直连模式下并发条目各自 getAwemeDetail
+        // 会绕开「抖音 API 串行」的风控口径；桥接模式桥内本已串行，闸门只是无害复述
+        const raw = await this.detailGate.run(() => this.client.getAwemeDetail(job.id));
+        // 来源还原（第四轮声明、第六轮接线）：按台账来源重建，不再硬编码 collection
+        const item = raw ? DouyinClient.normalize(raw, job.source ?? "collection") : null;
         if (!item) {
           summary.errors.push(`补跑 ${job.id}：无法获取详情`);
           return false;
@@ -1114,6 +1945,7 @@ export class SyncEngine {
           job.currentPath,
           job.asrOverride,
           job.frameHint,
+          job.reextract,
         );
         if (ok) this.state.processed[job.id].path = job.currentPath;
         this.markStateDirty();
@@ -1123,9 +1955,20 @@ export class SyncEngine {
         return false;
       }
     });
-    for (const ok of results) {
-      if (ok) done++;
-      else failed++;
+    for (let i = 0; i < results.length; i++) {
+      const ok = results[i];
+      const id = jobs[i]?.id;
+      if (ok) {
+        done++;
+        // 成功即清除连续失败计数（第四轮声明、第六轮接线）
+        if (id && this.state.backfillFails) delete this.state.backfillFails[id];
+      } else {
+        failed++;
+        if (id) {
+          this.state.backfillFails ??= {};
+          this.state.backfillFails[id] = (this.state.backfillFails[id] ?? 0) + 1;
+        }
+      }
     }
     await this.saveState();
     const parts = [`补跑完成：处理 ${done}，跳过 ${skipped}，失败 ${failed}`];
