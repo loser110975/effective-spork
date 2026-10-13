@@ -124,6 +124,46 @@ export function runTests(m) {
       t("state.json 缺失不算致命", r3.settings.cookie === "only-s" && r3.state === null);
     }
 
+    console.log("— 存储拆分：半布局崩溃恢复（迁移双写之间被杀 + 旧 data.json 仍在）—");
+    {
+      const legacy = {
+        settings: { cookie: "legacy-cookie", maxTranscribePerSync: 7 },
+        state: { processed: { id1: { path: "a.md", syncedAt: "t", folder: "f" } }, pendingAsr: ["x"] },
+      };
+      // 场景 A：settings.json 已落、state.json 未落（第一次 rename 后崩溃）→ settings 半读新、state 半从 data.json 回捞
+      const a = new FakeAdapter();
+      const legacyBytes = JSON.stringify(legacy);
+      a.files.set(pathOf("data.json"), legacyBytes);
+      a.files.set(pathOf("settings.json"), JSON.stringify({ cookie: "new-cookie" }));
+      const st = store(a);
+      const r = await st.load();
+      t("半布局 A：settings 半读新文件", r.settings && r.settings.cookie === "new-cookie");
+      t("半布局 A：state 半从 data.json 键域回捞", r.state && r.state.processed.id1.path === "a.md" && r.state.pendingAsr[0] === "x");
+      t("半布局 A：旧 data.json 字节级不变（回滚锚点）", a.files.get(pathOf("data.json")) === legacyBytes);
+      t("半布局 A：settings.json 未被 load 改写", JSON.parse(a.files.get(pathOf("settings.json"))).cookie === "new-cookie");
+      // 随后一次 save：重建出完整 state.json（下次保存将重建新文件语义）
+      await st.writeSplit(r.settings, r.state);
+      t("半布局 A：save 后 state.json 完整重建", a.files.has(pathOf("state.json")) && JSON.parse(a.files.get(pathOf("state.json"))).processed.id1.path === "a.md");
+      t("半布局 A：save 后 settings.json 内容保持新值", JSON.parse(a.files.get(pathOf("settings.json"))).cookie === "new-cookie");
+      // 幂等复验：重建后的完整布局再 load 读双新文件，不再碰 data.json
+      a.files.set(pathOf("data.json"), legacyBytes); // 保持锚点原值，确认 load 不再依赖它
+      const r2 = await st.load();
+      t("半布局 A：重建后 load 读双新文件（state 来自 state.json）", r2.migrated === false && r2.state.pendingAsr[0] === "x" && r2.settings.cookie === "new-cookie");
+
+      // 场景 B（对称）：state.json 已落、settings.json 未落 → state 半读新、settings 半从 data.json 回捞
+      const b = new FakeAdapter();
+      b.files.set(pathOf("data.json"), legacyBytes);
+      b.files.set(pathOf("state.json"), JSON.stringify({ processed: { id2: { path: "b.md" } }, pendingAsr: [] }));
+      const rb = await store(b).load();
+      t("半布局 B：state 半读新文件", rb.state && rb.state.processed.id2.path === "b.md");
+      t("半布局 B：settings 半从 data.json 键域回捞", rb.settings && rb.settings.cookie === "legacy-cookie" && rb.settings.maxTranscribePerSync === 7);
+      t("半布局 B：旧 data.json 字节级不变", b.files.get(pathOf("data.json")) === legacyBytes);
+      // 随后一次 save：settings.json 重建
+      const stB = store(b);
+      await stB.writeSplit(rb.settings, rb.state);
+      t("半布局 B：save 后 settings.json 完整重建", b.files.has(pathOf("settings.json")) && JSON.parse(b.files.get(pathOf("settings.json"))).cookie === "legacy-cookie");
+    }
+
     console.log("— 存储拆分：原子写（.tmp 中间态 + rename；rename 失败 remove 重试）—");
     {
       const a = new FakeAdapter();
