@@ -11,7 +11,8 @@ import { pushSummaryRecord } from "./statusCore";
 import { generateSummaryForFile } from "./summaryService";
 import { statusVisual } from "./statusCore";
 import { needsBackupRescue, pickSettingsSource, sanitizeNumericSettings } from "./settingsSanitize";
-import { fsExists, nodeRequire } from "./util";
+// nodeRequire 已随 P2-1 迁出（spawn 实现整体移至 ProcessManager.ensureRunning）
+import { fsExists } from "./util";
 
 const SYNC_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9"/><polyline points="21 3 21 9 15 9"/><path d="M9 10v4l3 2"/></svg>`;
 
@@ -52,116 +53,16 @@ export default class DouyinSyncPlugin extends Plugin {
   }
 
   private async spawnBridgeInner(): Promise<void> {
-    const ping = `${this.settings.bridgeUrl}/ping`;
-    // 三态探测（第九轮 C15）：ready=就绪；starting=桥已监听但浏览器未就绪（慢启动，要等不能杀）；
-    // down=不可达。原实现二值化后，慢机器上 Chromium 启动超 15s 的健康桥会被超时分支 taskkill。
-    const probe = async (): Promise<"ready" | "starting" | "down"> => {
-      try {
-        const r = await requestUrl({ url: ping, method: "GET", throw: false });
-        if (r.status !== 200) return "down";
-        const j = r.json;
-        return !!j?.ok && !!j?.ready ? "ready" : j?.ok ? "starting" : "down";
-      } catch {
-        return "down";
+    // P2-1 单轨化：spawn→探测→就绪轮询→超时兜底的完整实现已迁至 ProcessManager.ensureRunning
+    // （三态探测 / 15s·45s·60s 超时常量 / stderr 管道诊断 / detached+NODE_PATH / taskkill /T 整树
+    // 全部复用 PM 一套，trackEngineSpawn 登记在 PM 内部完成，任何拉起路径都登记）。
+    // 本方法只保留 main 侧关注点：60s 失败冷却的判定与记账（lastSpawnFailAt 在 spawnBridge 的
+    // catch 里写入）；冷却门以回调注入，保证「先探测、后冷却」次序（回归审查 #6）。
+    await this.processManager.ensureRunning(() => {
+      if (Date.now() - this.lastSpawnFailAt < 60_000) {
+        throw new Error("本地桥接刚拉起失败（60 秒冷却内），请检查 Node / 依赖配置或用「测试连接」复验");
       }
-    };
-    if ((await probe()) === "ready") return;
-    // 冷却检查放在探测之后（回归审查 #6）：桥可能已在启动中或被外部拉起，
-    // 冷却挡住「先 ping」会造成桥就绪后仍报「冷却内」的假性失败
-    if (Date.now() - this.lastSpawnFailAt < 60_000) {
-      throw new Error("本地桥接刚拉起失败（60 秒冷却内），请检查 Node / 依赖配置或用「测试连接」复验");
-    }
-    // 端口解析与 processManager.port() 同款正则：split(":").pop() 在无端口 URL 上会把「//127.0.0.1」当端口
-    const portMatch = this.settings.bridgeUrl.match(/:(\d+)\s*\/?$/);
-    const port = portMatch ? portMatch[1] : "8765";
-    // 脚本路径走 resolveBridgeScript（2026-09-27 第四轮）：manifest.dir 是 Vault 相对路径，
-    // Obsidian 进程 cwd ≠ Vault 根时 path.join 出来的相对路径解析失败，且 stdio:ignore 把
-    // 「Cannot find module」吞掉，用户只看到「启动超时」；resolveBridgeScript 核过存在性
-    const script = this.resolveBridgeScript();
-    const spawn = nodeRequire<{ spawn: typeof import("child_process").spawn }>("child_process")?.spawn;
-    if (!spawn) throw new Error("Node 运行时不可用（非桌面端或 nodeIntegration 关闭），无法拉起桥接");
-    // 未配置路径时回退到 PATH 里的 node；未配置依赖目录时不写 NODE_PATH，交给常规解析。
-    // 安装脚本会按目标机器把这两项写好，所以正常情况下都命中第一个分支。
-    const nodeExe = (this.settings.bridgeNodePath || "").trim() || "node";
-    const env: Record<string, string | undefined> = { ...process.env };
-    const modulesDir = (this.settings.bridgeNodeModules || "").trim();
-    if (modulesDir) env.NODE_PATH = modulesDir;
-    const child = spawn(nodeExe, [script, port], {
-      detached: true,
-      // stderr 走管道（第九轮 C4，与 PM 路径同款）：缺脚本/缺依赖时 node 秒退、stderr 带真实原因，
-      // 原 stdio:"ignore" + 无 exit 监听 = 诊断黑洞，只能空等满 15s 后给通用报错
-      stdio: ["ignore", "ignore", "pipe"],
-      windowsHide: true,
-      env,
-      cwd: script ? path.dirname(script) : undefined,
     });
-    child.unref?.();
-    // spawn 后立即登记（2026-09-27 第四轮，原为 ready 后才登记）：慢机器上 Chromium 启动超 15s
-    // 时原实现走超时分支，这个 child 从未进过台账，dispose 的身份校验名单里没有它——孤儿无人回收
-    if (child.pid) this.processManager?.trackEngineSpawn(Number(child.pid));
-    // spawn 对不存在的可执行文件是异步 emit error（复审 P1）：不挂监听会以
-    // uncaught exception 崩掉渲染进程，用户看到的是崩溃而非本方法尾部的明确报错
-    const spawnErr: { err: Error | null } = { err: null };
-    child.on("error", (e: Error) => {
-      spawnErr.err = e;
-    });
-    let stderrTail = "";
-    child.stderr?.on("data", (d: unknown) => {
-      stderrTail = (stderrTail + String(d)).slice(-1200);
-    });
-    // 退出状态放对象里承载（回调赋值，TS 对基本类型局部变量会收窄成 never）
-    const exitState: { code: number | null; done: boolean } = { code: null, done: false };
-    child.on("exit", (code: number | null) => {
-      exitState.code = code;
-      exitState.done = true;
-    });
-    const START_TIMEOUT_MS = 15_000;
-    const startWaitAt = Date.now(); // 超时文案报告实际等待时长（第九轮复审批 2：C15 慢启动下原文案写死 15s 误导排查）
-    let deadline = Date.now() + START_TIMEOUT_MS;
-    const hardDeadline = deadline + 45_000; // 慢启动上限 60s（与 PM 路径 45s 原地等待对齐）
-    for (;;) {
-      await new Promise((r) => setTimeout(r, 500));
-      if (spawnErr.err) {
-        throw new Error(
-          `桥接进程启动失败：${spawnErr.err.message}（请检查 Node 路径「${nodeExe}」与依赖目录配置）`,
-        );
-      }
-      const st = await probe();
-      if (st === "ready") {
-        return;
-      }
-      if (exitState.done && st === "down") {
-        // 子进程已退出且端口无健康桥：带上 stderr 尾巴报真实原因（第九轮 C4）
-        const tail = stderrTail.trim().slice(-200);
-        throw new Error(
-          `桥接进程启动后立即退出（code=${exitState.code}）${tail ? `：${tail}` : ""}（脚本：${script}）`,
-        );
-      }
-      if (st === "starting") {
-        // 桥在启动中（可能外部拉起或本子进程慢启动）→ 延长等待而不是计失败并杀掉健康桥（第九轮 C15）
-        deadline = Math.min(hardDeadline, Math.max(deadline, Date.now() + 10_000));
-      }
-      if (Date.now() >= deadline) break;
-    }
-    // 超时兜底（2026-09-27 第四轮）：child.kill() 在 Windows 是 TerminateProcess，只杀 node 主进程，
-    // playwright 启动的 Chromium 成为孤儿继续持有 profile 锁，之后每次拉桥都失败。改 taskkill /F /T 整树终止
-    try {
-      child.kill();
-    } catch {
-      /* 已退出则忽略 */
-    }
-    if (child.pid) {
-      const cp = nodeRequire<{ exec: (cmd: string, opts: object, cb?: (err: unknown, stdout: string) => void) => void }>("child_process");
-      try {
-        cp?.exec(`taskkill /F /T /PID ${Number(child.pid)}`, { windowsHide: true }, () => {});
-      } catch {
-        /* 清理失败不影响报错路径 */
-      }
-    }
-    throw new Error(
-      `本地桥接启动超时（等了 ${Math.round((Date.now() - startWaitAt) / 1000)}s，慢启动上限 60s）。` +
-        `请确认：① Node 已安装且路径正确 ② 依赖目录含 playwright-core ③ 已扫码登录抖音。`,
-    );
   }
 
   async onload() {
