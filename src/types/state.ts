@@ -46,7 +46,8 @@ export interface SummaryRecord {
   model: string;
   status: "success" | "failed";
   errorCode?: string;
-  /** 失败原因全文（含 HTTP 状态与上游错误体），失败排查用；成功时不写 */
+  /** 失败原因全文（含 HTTP 状态与上游错误体），失败排查用；成功时不写。
+   *  例外（第十四轮）：status=success 但输出被 max_tokens 截断时，写入截断提示（OUTPUT_TRUNCATED_HINT）供补跑。 */
   errorMessage?: string;
   generatedAt: string;
   /** 摘要通道：video_multimodal = 视频多模态（转录+关键帧），缺省/text = 纯文本 */

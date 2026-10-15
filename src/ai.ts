@@ -9,12 +9,26 @@ const RATE_LIMIT_BACKOFF_MS = [5_000, 15_000, 30_000];
 /** 5xx 服务端过载（如硅基流动 503 + code 50508）单独一套退避：过载恢复通常更快，先短等。 */
 const SERVER_BUSY_BACKOFF_MS = [3_000, 10_000, 20_000];
 
+/**
+ * 输出截断提示（第十四轮，两摘要通道共用文案）：写入 SummaryRecord.errorMessage 与
+ * 用户 Notice。措辞指向设置项名称，用户照着改一次「摘要长度上限」即可补跑。
+ */
+export const OUTPUT_TRUNCATED_HINT = "输出被截断（max_tokens 上限），可调大设置「摘要长度上限」后补跑";
+
 /** OpenAI 兼容 Chat Completions（适配百炼 compatible-mode / 硅基流动 / OpenAI 等）。 */
 export class AiClient {
   private visionModel: string;
   private readonly baseUrl: string;
   private readonly key: string;
   private timeoutMs = DEFAULT_TIMEOUT_MS;
+  /**
+   * 最近一次 chat() 的输出是否最终仍被 length 截断（第十四轮）。
+   * 历史：finish_reason=length 已有自动扩预算重试，但「扩展后仍截断」与「钳制通道
+   * （glm-4v-flash 上限 1024）不扩展」两条路径都静默 return——调用方无从得知摘要被
+   * 拦腰砍断，不完整的摘要照常落盘且 summary_v 已写、永不重出。现在每次调用开始重置、
+   * 最终返回前按 finish_reason 置位，供摘要通道决定是否提示补跑（不触发失败重试链）。
+   */
+  lastResponseTruncated = false;
 
   constructor(
     baseUrl: string,
@@ -40,6 +54,8 @@ export class AiClient {
   }
 
   async chat(messages: any[], model?: string, maxTokens = 500): Promise<string> {
+    // 截断标记按次重置（第十四轮）：复用同一 client 连续调用时，上一次的截断状态不得泄漏
+    this.lastResponseTruncated = false;
     // 配置缺失 / 无效 → 给出指向设置页的明确错误（统一接入约定，见 aiConfig.ts）
     const configProblem = baseUrlProblem(this.baseUrl, "AI") || apiKeyProblem(this.key, "AI");
     if (configProblem) throw new Error(configProblem);
@@ -134,6 +150,9 @@ export class AiClient {
         tokens = Math.min(4000, tokens * 2);
         continue;
       }
+      // 最终仍以 length 收尾（扩预算用尽 / 钳制通道不扩展）→ 置位截断标记（第十四轮），
+      // 让摘要通道写入 record.errorMessage 并提醒用户补跑；此处维持原行为照常返回截断文本
+      if (data?.choices?.[0]?.finish_reason === "length") this.lastResponseTruncated = true;
       return text.trim();
     }
   }

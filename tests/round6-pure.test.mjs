@@ -77,19 +77,21 @@ export function runTests(m) {
     t("既有版本号保留", /^summary_v: 2$/m.test(out3));
   }
 
-  console.log("— aiConfig：dashscopeKey 兜底的基址约束 —");
+  console.log("— aiConfig：通道独立化（2026-10-15 回退链移除）—");
   {
     const zhipu = "https://open.bigmodel.cn/api/paas/v4";
     const s1 = { ...DEFAULT_SETTINGS, aiBaseUrl: zhipu, aiKey: "", dashscopeKey: "sk-bailian" };
-    t("非百炼基址 + Key 留空 → 明确报未配置（不再把百炼 Key 打向第三方 401）", (m.resolveAiChannel(s1).problem || "").includes("API Key 未配置"));
-    const s2 = { ...DEFAULT_SETTINGS, aiKey: "", dashscopeKey: "sk-bailian" };
-    t("默认百炼基址保留兜底", m.resolveAiChannel(s2).apiKey === "sk-bailian" && m.resolveAiChannel(s2).problem === "");
-    const s3 = { ...DEFAULT_SETTINGS, visionBaseUrl: zhipu, visionApiKey: "", aiKey: "k-zhipu", dashscopeKey: "sk-bailian" };
-    t("自定义非百炼视觉基址优先同源 aiKey", m.resolveVisionChannel(s3).apiKey === "k-zhipu");
-    const s4 = { ...DEFAULT_SETTINGS, visionBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", visionApiKey: "", aiKey: "k-zhipu", dashscopeKey: "sk-bailian" };
-    t("自定义百炼系视觉基址仍优先 dashscopeKey（旧兼容行为不变）", m.resolveVisionChannel(s4).apiKey === "sk-bailian");
-    const s5 = { ...DEFAULT_SETTINGS, videoSummaryBaseUrl: zhipu, videoSummaryApiKey: "", aiKey: "k-zhipu", dashscopeKey: "sk-bailian" };
-    t("视频多模态专用基址 + aiKey 同源可用", m.resolveVideoSummaryChannel(s5).apiKey === "k-zhipu" && m.resolveVideoSummaryChannel(s5).problem === "");
+    t("AI 通道：aiKey 留空 → 报未配置（即使 dashscopeKey 有值也不再借用）", (m.resolveAiChannel(s1).problem || "").includes("API Key 未配置"));
+    const s2 = { ...DEFAULT_SETTINGS, aiBaseUrl: "", aiKey: "", dashscopeKey: "sk-bailian" };
+    t("AI 通道：基址落默认值，Key 留空仍报未配置", (m.resolveAiChannel(s2).problem || "").includes("API Key 未配置"));
+    const s3 = { ...DEFAULT_SETTINGS, visionBaseUrl: "", visionApiKey: "", aiBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", aiKey: "k-ai", dashscopeKey: "sk-bailian" };
+    t("视觉通道：独立基址/Key 全空 → 报未配置（不再回退 aiBaseUrl/aiKey）", m.resolveVisionChannel(s3).baseUrl === "" && (m.resolveVisionChannel(s3).problem || "").includes("未配置"));
+    const s4 = { ...DEFAULT_SETTINGS, visionBaseUrl: zhipu, visionApiKey: "", aiKey: "k-zhipu", dashscopeKey: "sk-bailian" };
+    t("视觉通道：独立基址已填、Key 留空 → 只报 Key 未配置（不借用 aiKey/dashscopeKey）", (m.resolveVisionChannel(s4).problem || "").includes("API Key 未配置"));
+    const s5 = { ...DEFAULT_SETTINGS, videoSummaryBaseUrl: "", videoSummaryApiKey: "", aiKey: "k-ai", dashscopeKey: "sk-bailian" };
+    t("多模态通道：专用基址/Key 全空 → 报未配置（不再回退 AI 通道）", (m.resolveVideoSummaryChannel(s5).problem || "").includes("未配置"));
+    const s6 = { ...DEFAULT_SETTINGS, ocrBaseUrl: zhipu, ocrApiKey: "", aiKey: "k-ai", dashscopeKey: "sk-bailian" };
+    t("OCR 面板主通道：Key 留空 → 报未配置（不再回退 aiKey/dashscopeKey）", (m.resolveOcrPanelChannel(s6).problem || "").includes("API Key 未配置"));
   }
 
   console.log("— sortFramePaths：帧序号数值排序（≥100 帧末帧不再乱序）—");

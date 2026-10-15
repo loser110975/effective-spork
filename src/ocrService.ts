@@ -1,6 +1,6 @@
-// ocrService.ts — M2 图片 OCR（Agnes 主通道 + 显式确认后的付费兜底 + 结果展示 / 复制 / 导出）。
+// ocrService.ts — M2 图片 OCR（Agnes 主通道 + 结果展示 / 复制 / 导出）。
 // 设计依据：delivery/系统设计.md §3.2.M2、§4.2.4；验收标准：UserStory §5.2。
-// 关键约束：主通道失败**不自动回退**，必须弹确认、经用户同意才调用付费通道（经中间确认）。
+// 2026-10-13：付费兜底通道（确认弹窗 + fallback 调用）整体移除，仅保留主通道。
 import { App, Modal, Notice, TFile } from "obsidian";
 import type { DouyinSyncSettings } from "./types/settings";
 import type { VisionRecord } from "./types/state";
@@ -30,15 +30,13 @@ function bytesToBase64(bytes: Uint8Array): string {
 export interface OcrOutcome {
   ok: boolean;
   text: string;
-  channel: "primary" | "fallback";
-  /** 实际使用的模型名（展示用：付费确认弹窗与结果框不再硬编码模型名） */
+  /** 实际使用的模型名（展示用：结果框不再硬编码模型名） */
   modelUsed?: string;
   errorCode?: string;
   /** 具体失败原因（如 Base URL / API Key 未配置），供界面直接展示 */
   error?: string;
   elapsedMs: number;
   imagePath: string;
-  declinedFallback?: boolean;
 }
 
 /** 选择本地图片（点击选择 + 拖拽，见 UserStory §5.2.2 交互方式）。 */
@@ -67,11 +65,11 @@ export async function readImageAsDataUrl(file: File): Promise<{ dataUrl?: string
   return { dataUrl: `data:${mime};base64,${bytesToBase64(buf)}` };
 }
 
-/** 调用一次视觉模型（OpenAI 兼容）。channel 决定用 Agnes 主通道还是兜底通道。 */
-async function callVision(s: DouyinSyncSettings, channel: "primary" | "fallback", dataUrl: string, hint: string): Promise<{ ok: boolean; text?: string; errorCode?: string; error?: string }> {
+/** 调用一次视觉模型（OpenAI 兼容，Agnes 主通道）。 */
+async function callVision(s: DouyinSyncSettings, dataUrl: string, hint: string): Promise<{ ok: boolean; text?: string; errorCode?: string; error?: string }> {
   // 统一接入：Base URL + API Key 由 aiConfig 从 settings 解析（含 Agnes 主通道 → AI Key 回退链）
-  const chan = resolveOcrPanelChannel(s, channel);
-  const model = channel === "primary" ? s.ocrModelPrimary : s.ocrModelFallback;
+  const chan = resolveOcrPanelChannel(s);
+  const model = s.ocrModelPrimary;
   // 配置缺失 / 无效：明确给出原因（保持 201001 错误码语义不变）
   if (chan.problem) return { ok: false, errorCode: "201001", error: chan.problem };
   const client = new AiClient(chan.baseUrl, chan.apiKey, model, model);
@@ -84,77 +82,13 @@ async function callVision(s: DouyinSyncSettings, channel: "primary" | "fallback"
   }
 }
 
-/** 主通道 OCR；失败时按 ocrFallbackEnabled 走「显式确认 → 付费兜底」。 */
-export async function ocrWithFallback(s: DouyinSyncSettings, dataUrl: string, imagePath: string, hint: string): Promise<OcrOutcome> {
+/** 主通道 OCR：失败直接返回失败结果（付费兜底通道已移除）。 */
+export async function runOcr(s: DouyinSyncSettings, dataUrl: string, imagePath: string, hint: string): Promise<OcrOutcome> {
   const started = Date.now();
-  const primary = await callVision(s, "primary", dataUrl, hint);
-  if (primary.ok) {
-    return { ok: true, text: primary.text ?? "", channel: "primary", modelUsed: s.ocrModelPrimary, elapsedMs: Date.now() - started, imagePath };
-  }
-  if (!s.ocrFallbackEnabled) {
-    return { ok: false, text: "", channel: "primary", modelUsed: s.ocrModelPrimary, errorCode: primary.errorCode, error: primary.error, elapsedMs: Date.now() - started, imagePath };
-  }
-  const approved = await confirmFallback(s);
-  if (!approved) {
-    // 取消路径：不发起任何付费调用（UserStory §5.2.6 新增 AC）
-    return { ok: false, text: "", channel: "primary", modelUsed: s.ocrModelPrimary, errorCode: primary.errorCode, error: primary.error, elapsedMs: Date.now() - started, imagePath, declinedFallback: true };
-  }
-  const fb = await callVision(s, "fallback", dataUrl, hint);
-  if (fb.ok) {
-    return { ok: true, text: fb.text ?? "", channel: "fallback", modelUsed: s.ocrModelFallback, elapsedMs: Date.now() - started, imagePath };
-  }
-  return {
-    ok: false,
-    text: "",
-    channel: "fallback",
-    modelUsed: s.ocrModelFallback,
-    errorCode: fb.errorCode ?? primary.errorCode,
-    error: fb.error ?? primary.error,
-    elapsedMs: Date.now() - started,
-    imagePath,
-  };
-}
-
-/** 付费兜底确认弹窗：计费对象用实际配置的模型与端点（2026-09-27 修：不再硬编码「百炼 qwen3-vl-plus」）。 */
-function confirmFallback(s: DouyinSyncSettings): Promise<boolean> {
-  const chan = resolveOcrPanelChannel(s, "fallback");
-  const target = `${s.ocrModelFallback}（${chan.baseUrl || "未配置端点"}）`;
-  return new Promise((resolve) => {
-    class ConfirmModal extends Modal {
-      onOpen() {
-        this.contentEl.createEl("p", { text: "识别失败，是否改用付费通道重试？" });
-        this.contentEl.createEl("p", {
-          cls: "mod-muted",
-          text: `将调用 ${target}（按 token 计费）。取消则不发起任何付费调用。`,
-        });
-        const row = this.contentEl.createDiv();
-        row.style.display = "flex";
-        row.style.gap = "8px";
-        row.style.justifyContent = "flex-end";
-        // resolve 必须在 close() 之前（2026-09-27 第四轮修）：Modal.close() 会同步触发 onClose，
-        // 原先「先 close 再 resolve(true)」的确认按钮被 onClose 的 resolve(false) 抢先落定——
-        // 用户明确点了「使用付费通道重试」，实际却按取消处理，付费兜底通道形同虚设
-        row.createEl("button", { text: "取消" }).onclick = () => {
-          resolve(false);
-          this.close();
-        };
-        row.createEl("button", { cls: "mod-cta", text: "使用付费通道重试" }).onclick = () => {
-          resolve(true);
-          this.close();
-        };
-      }
-      onClose() {
-        resolve(false);
-      }
-    }
-    void new ConfirmModal(app0).open();
-  });
-}
-
-/** 供 Modal 使用的 App 引用（由 main.ts 注入，避免与 main.ts 形成循环依赖）。 */
-let app0: App;
-export function setOcrApp(app: App): void {
-  app0 = app;
+  const r = await callVision(s, dataUrl, hint);
+  return r.ok
+    ? { ok: true, text: r.text ?? "", modelUsed: s.ocrModelPrimary, elapsedMs: Date.now() - started, imagePath }
+    : { ok: false, text: "", modelUsed: s.ocrModelPrimary, errorCode: r.errorCode, error: r.error, elapsedMs: Date.now() - started, imagePath };
 }
 
 /** 记录 OCR 结果（保留最近 200 条，见 安全设计 §3.3.5 数据最小化）。 */
@@ -168,7 +102,6 @@ export class OcrResultModal extends Modal {
   constructor(
     app: App,
     private text: string,
-    private channel: "primary" | "fallback",
     private modelUsed = "",
   ) {
     super(app);
@@ -177,10 +110,8 @@ export class OcrResultModal extends Modal {
   onOpen(): void {
     this.contentEl.empty();
     this.contentEl.createEl("h4", { text: "图片文字识别结果" });
-    const label = this.modelUsed || (this.channel === "primary" ? "主通道" : "付费兜底");
-    this.contentEl.createDiv({ cls: "mod-muted" }).setText(
-      this.channel === "primary" ? `通道：${label}（主）` : `通道：${label}（付费兜底，已确认）`,
-    );
+    const label = this.modelUsed || "主通道";
+    this.contentEl.createDiv({ cls: "mod-muted" }).setText(`通道：${label}（主）`);
     const box = this.contentEl.createEl("textarea");
     box.value = this.text;
     box.style.width = "100%";

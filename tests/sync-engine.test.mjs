@@ -359,6 +359,9 @@ export function runTests(m) {
           aiBaseUrl: "https://ai.example/v1",
           aiModel: "test-model",
           summaryMaxTokens: 500,
+          // 2026-10-15 通道独立化：多模态通道不再回退 aiKey，必须显式配置才可用
+          videoSummaryBaseUrl: "https://ai.example/v1",
+          videoSummaryApiKey: "k-vs",
         }),
         vault,
         calls,

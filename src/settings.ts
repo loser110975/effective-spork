@@ -219,14 +219,9 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
         .setName("打开图片识别")
         .setDesc("选择本地图片并识别（也可用命令「图片文字识别」）")
         .addButton((b) => b.setButtonText("选择图片").onClick(() => void this.plugin.openOcr()));
-      new Setting(containerEl).setName("主通道 Base URL（Agnes）").setDesc("如 https://api.agnes-ai.cn/v1 或 https://apihub.agnes-ai.com/v1").addText((t) => t.setValue(s.ocrBaseUrl).onChange(async (v) => { s.ocrBaseUrl = v.trim() || DEFAULT_SETTINGS.ocrBaseUrl; this.queueSave(); }));
-      new Setting(containerEl).setName("主通道 API Key（Agnes）").setDesc("留空则复用下方 AI Key").addText((t) => { t.setValue(s.ocrApiKey).onChange(async (v) => { s.ocrApiKey = v.trim(); this.queueSave(); }); t.inputEl.type = "password"; });
-      new Setting(containerEl).setName("主通道模型").addText((t) => t.setValue(s.ocrModelPrimary).onChange(async (v) => { s.ocrModelPrimary = v.trim() || DEFAULT_SETTINGS.ocrModelPrimary; this.queueSave(); }));
-      new Setting(containerEl).setName("兜底模型").setDesc("主通道失败并经你确认后才调用（付费）").addText((t) => t.setValue(s.ocrModelFallback).onChange(async (v) => { s.ocrModelFallback = v.trim() || DEFAULT_SETTINGS.ocrModelFallback; this.queueSave(); }));
-      new Setting(containerEl)
-        .setName("允许付费兜底通道")
-        .setDesc("开启后主通道失败会弹窗询问「是否改用付费通道重试」；关闭则完全不使用付费通道。任何兜底调用都必须经你确认，绝不自动回退")
-        .addToggle((t) => t.setValue(s.ocrFallbackEnabled).onChange(async (v) => { s.ocrFallbackEnabled = v; this.queueSave(); }));
+      new Setting(containerEl).setName("Base URL").addText((t) => t.setValue(s.ocrBaseUrl).onChange(async (v) => { s.ocrBaseUrl = v.trim() || DEFAULT_SETTINGS.ocrBaseUrl; this.queueSave(); }));
+      new Setting(containerEl).setName("API Key").addText((t) => { t.setValue(s.ocrApiKey).onChange(async (v) => { s.ocrApiKey = v.trim(); this.queueSave(); }); t.inputEl.type = "password"; });
+      new Setting(containerEl).setName("模型").addText((t) => t.setValue(s.ocrModelPrimary).onChange(async (v) => { s.ocrModelPrimary = v.trim() || DEFAULT_SETTINGS.ocrModelPrimary; this.queueSave(); }));
     }
 
     new Setting(containerEl).setName("AI 总结（组件开关）").setHeading();
@@ -240,7 +235,8 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
         .setName("为当前笔记生成摘要")
         .setDesc("也可用命令「为当前笔记生成 AI 摘要」")
         .addButton((b) => b.setButtonText("生成摘要").onClick(() => void this.plugin.summarizeActive()));
-      new Setting(containerEl).setName("摘要长度上限（tokens）").addText((t) => t.setValue(String(s.summaryMaxTokens)).onChange(async (v) => { const n = parseInt(v, 10); s.summaryMaxTokens = Number.isFinite(n) ? Math.max(200, Math.min(4000, n)) : 500; this.queueSave(); }));
+      // 非法回退 500→2000（第十四轮，与新默认同口径）
+      new Setting(containerEl).setName("摘要长度上限（tokens）").addText((t) => t.setValue(String(s.summaryMaxTokens)).onChange(async (v) => { const n = parseInt(v, 10); s.summaryMaxTokens = Number.isFinite(n) ? Math.max(200, Math.min(4000, n)) : 2000; this.queueSave(); }));
     }
 
     new Setting(containerEl).setName("相关笔记互链").setHeading();
@@ -262,7 +258,6 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("视频多模态总结（视频类收藏专用）").setHeading();
     new Setting(containerEl)
       .setName("同步时自动生成视频摘要")
-      .setDesc("新视频完成转录+抽帧后，自动把转录文字与关键帧图片一并交给百炼多模态模型，生成带配图的摘要；图文类收藏不受影响")
       .addToggle((t) => t.setValue(s.videoSummaryEnabled).onChange(async (v) => { s.videoSummaryEnabled = v; this.queueSave(); this.display(); }));
     if (s.videoSummaryEnabled) {
       new Setting(containerEl)
@@ -282,12 +277,10 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
             }),
         );
       new Setting(containerEl)
-        .setName("多模态 Base URL（可选）")
-        .setDesc("留空复用上方 AI Base URL；接入智谱填 https://open.bigmodel.cn/api/paas/v4")
+        .setName("多模态 Base URL")
         .addText((t) => t.setValue(s.videoSummaryBaseUrl).onChange(async (v) => { s.videoSummaryBaseUrl = v.trim(); this.queueSave(); }));
       new Setting(containerEl)
-        .setName("多模态 API Key（可选）")
-        .setDesc("留空复用上方 AI Key；接入智谱等独立服务时填对应 Key")
+        .setName("多模态 API Key")
         .addText((t) => { t.setValue(s.videoSummaryApiKey).onChange(async (v) => { s.videoSummaryApiKey = v.trim(); this.queueSave(); }); t.inputEl.type = "password"; });
       new Setting(containerEl)
         .setName("抽帧间隔（秒）")
@@ -315,11 +308,11 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
       );
     if (s.asrProvider === "siliconflow_sensevoice") {
       new Setting(containerEl)
-        .setName("硅基流动 API Key")
+        .setName("语音API Key")
         .setDesc("cloud.siliconflow.cn 创建；模型固定为 FunAudioLLM/SenseVoiceSmall（视频语音转录）")
         .addText((t) => { t.setValue(s.siliconflowKey).onChange(async (v) => { s.siliconflowKey = v.trim(); this.queueSave(); }); t.inputEl.type = "password"; });
       new Setting(containerEl)
-        .setName("硅基流动 Base URL")
+        .setName("语音Base URL")
         .setDesc("ASR 上传端点基址；默认 https://api.siliconflow.cn/v1，走中转代理时才需要改")
         .addText((t) => t.setValue(s.siliconflowBaseUrl).onChange(async (v) => { s.siliconflowBaseUrl = v.trim() || DEFAULT_SETTINGS.siliconflowBaseUrl; this.queueSave(); }));
       new Setting(containerEl)
@@ -364,7 +357,7 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName("AI（分类 / 图片文字识别，OpenAI 兼容接口）").setHeading();
     new Setting(containerEl).setName("API Base URL").addText((t) => t.setValue(s.aiBaseUrl).onChange(async (v) => { s.aiBaseUrl = v.trim() || DEFAULT_SETTINGS.aiBaseUrl; this.queueSave(); }));
-    new Setting(containerEl).setName("API Key").setDesc("留空则自动复用上方百炼 DashScope Key（推荐）").addText((t) => { t.setValue(s.aiKey).onChange(async (v) => { s.aiKey = v.trim(); this.queueSave(); }); t.inputEl.type = "password"; });
+    new Setting(containerEl).setName("API Key").addText((t) => { t.setValue(s.aiKey).onChange(async (v) => { s.aiKey = v.trim(); this.queueSave(); }); t.inputEl.type = "password"; });
     new Setting(containerEl).setName("文本模型（自动分类）").addText((t) => t.setValue(s.aiModel).onChange(async (v) => { s.aiModel = v.trim() || "qwen-plus"; this.queueSave(); }));
     new Setting(containerEl).setName("启用 AI 自动分类").addToggle((t) => t.setValue(s.enableCategory).onChange(async (v) => { s.enableCategory = v; this.queueSave(); }));
     new Setting(containerEl)
@@ -379,11 +372,9 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("视觉模型").addText((t) => t.setValue(s.visionModel).onChange(async (v) => { s.visionModel = v.trim() || "qwen-vl-plus"; this.queueSave(); }));
     new Setting(containerEl)
       .setName("OCR 独立通道（基址）")
-      .setDesc("留空则复用上面的 AI 基址。实测硅基流动的视觉模型高峰期会返回 503（System is too busy），把它切到百炼 compatible-mode 可显著改善")
       .addText((t) => t.setValue(s.visionBaseUrl).onChange(async (v) => { s.visionBaseUrl = v.trim(); this.queueSave(); }));
     new Setting(containerEl)
       .setName("OCR 独立通道（Key）")
-      .setDesc("留空则复用 AI Key / 百炼 Key")
       .addText((t) => { t.setValue(s.visionApiKey).onChange(async (v) => { s.visionApiKey = v.trim(); this.queueSave(); }); t.inputEl.type = "password"; });
     new Setting(containerEl)
       .setName("OCR 全局并发")

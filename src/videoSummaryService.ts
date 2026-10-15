@@ -7,18 +7,21 @@ import { App, TFile, TFolder, Vault, normalizePath } from "obsidian";
 import type { DouyinSyncSettings } from "./types/settings";
 import type { SummaryRecord } from "./types/state";
 import type { SummaryStyle } from "./types/settings";
-import { AiClient } from "./ai";
+import { AiClient, OUTPUT_TRUNCATED_HINT } from "./ai";
 import { resolveVideoSummaryChannel } from "./aiConfig";
 import { stripFrameMarkers, applySummaryToNote, upsertFmScalar, pickEvenly } from "./statusCore";
-import { sliceByCodePoints } from "./util";
+import { headTailSlice, sliceByCodePoints, SOURCE_TRUNCATION_NOTICE } from "./util";
 
 /**
- * 转录文本截断长度。
- * 性能实测（2026-09-19）：视频摘要 p50 155.1s，是单条最大的耗时项。
- * 输入侧 8000 字转录 ≈ 1.2 万 token，而画面信息主要由关键帧承载、转录只是口播补充，
- * 截到 4000 字可减少输入 token，对摘要质量的边际影响很小。
+ * 转录文本首尾保留切分（第十四轮）：总量维持 4000 的性能口径（实测 2026-09-19：视频摘要
+ * p50 155.1s，是单条最大耗时项；输入侧 8000 字转录 ≈ 1.2 万 token，画面信息主要由关键帧
+ * 承载、转录只是口播补充，4000 字对摘要质量的边际影响很小），但由头部截断改为
+ * 「首 3000 + 尾 1000」。历史教训：头部截断把长视频结尾（结论 / recap）——最有价值的
+ * 要点候选——静默丢掉，「总结与意义」节只能凭前文脑补；截断事实另由 SOURCE_TRUNCATION_NOTICE
+ * 明示进提示词（buildPrompt 的 transcriptTruncated 参数）。
  */
-const MAX_TRANSCRIPT_CHARS = 4000;
+const TRANSCRIPT_HEAD_CHARS = 3000;
+const TRANSCRIPT_TAIL_CHARS = 1000;
 export const SUMMARY_V = 3; // 摘要格式版本：v3 = 层级笔记体（主题标题/引言/内容分节/总结与意义/AI 总结，无照片）；补跑据此重出旧格式摘要（第十轮 F2 撞库摘要保护同口径）
 
 /**
@@ -131,7 +134,7 @@ async function framesToDataUrls(
   return out;
 }
 
-/** 提示词组装（导出供测试断言风格分支）。 */
+/** 提示词组装（导出供测试断言风格分支）。transcript 由调用方先用 headTailSlice 切好。 */
 export function buildPrompt(input: {
   title: string;
   desc?: string;
@@ -139,6 +142,8 @@ export function buildPrompt(input: {
   frameCount: number;
   intervalSec: number;
   style: SummaryStyle;
+  /** 转录是否被首尾保留式截断（第十四轮）：仅截断时在提示词里明示中段缺失，模型不编造中段 */
+  transcriptTruncated?: boolean;
 }): string {
   const frameDesc = input.frameCount > 0
     ? `（共 ${input.frameCount} 张，从视频全片每隔约 ${input.intervalSec} 秒均匀抽取、按时间顺序排列——分别对应视频的开头、中段与结尾）`
@@ -159,7 +164,10 @@ export function buildPrompt(input: {
   parts.push(
     "",
     input.transcript.trim()
-      ? `语音转录文字：\n${sliceByCodePoints(input.transcript, MAX_TRANSCRIPT_CHARS)}`
+      ? // 转录已由调用方按「首 3000 + 尾 1000」切好（第十四轮）；这里不再二次截断——
+        // 中段省略标记若被截掉，明示句就成了谎言
+        `语音转录文字：\n${input.transcript}` +
+          (input.transcriptTruncated ? `\n${SOURCE_TRUNCATION_NOTICE}` : "")
       : "语音转录文字：（空或无效——完全依据画面字幕卡与视频文案重建内容，把画面里能读到的信息充分写入摘要，绝不虚构）",
   );
   return parts.join("\n");
@@ -185,7 +193,7 @@ export async function generateAndWriteVideoSummary(
   const model = s.videoSummaryModel || "qwen3-vl-plus-2025-12-19";
   // 风格预设：历史 data.json 可能存有不在预设集里的值，回退 hierarchy
   const style: SummaryStyle = STYLE_SPECS[s.videoSummaryStyle] ? s.videoSummaryStyle : "hierarchy";
-  // 统一接入：专用通道 Base URL / Key 留空时复用通用 AI 通道（aiBaseUrl/aiKey/dashscopeKey），由 aiConfig 统一解析
+  // 统一接入：专用通道只认自己的 Base URL / Key（2026-10-15 通道独立化，不再复用通用 AI 通道）
   const chan = resolveVideoSummaryChannel(s);
   if (chan.problem) return { ok: false, msg: chan.problem, model };
   if (!input.transcript.trim() && input.framePaths.length === 0) {
@@ -216,18 +224,23 @@ export async function generateAndWriteVideoSummary(
     const effectiveSec = images.length > 0 && input.framePaths.length > images.length
       ? Math.max(baseIntervalSec, Math.round((baseIntervalSec * input.framePaths.length) / images.length))
       : baseIntervalSec;
+    // 第十四轮：转录首尾保留（首 3000 + 尾 1000），截断事实同步进提示词——
+    // 头部截断会把长视频结尾（结论/recap）静默丢掉，模型还把截断结果当完整原文
+    const slicedTranscript = headTailSlice(input.transcript, TRANSCRIPT_HEAD_CHARS, TRANSCRIPT_TAIL_CHARS);
     const prompt = buildPrompt({
       title: input.title,
       desc: input.desc,
-      transcript: input.transcript,
+      transcript: slicedTranscript.text,
+      transcriptTruncated: slicedTranscript.truncated,
       frameCount: images.length,
       intervalSec: effectiveSec,
       style,
     });
     try {
       // 手改 data.json 的非数字 summaryMaxTokens 会算出 NaN → JSON.stringify 序列化成 null
-      // 送服务端（第九轮 B10）：设置页只在 UI onChange 消毒，消费端按有限数值兜底
-      const maxTokens = Number.isFinite(s.summaryMaxTokens) ? Math.max(500, Math.floor(s.summaryMaxTokens)) : 500;
+      // 送服务端（第九轮 B10）：设置页只在 UI onChange 消毒，消费端按有限数值兜底。
+      // 非数字回退 500→2000（第十四轮）：500 是已迁移掉的旧默认，兜底值应与新默认同口径
+      const maxTokens = Number.isFinite(s.summaryMaxTokens) ? Math.max(500, Math.floor(s.summaryMaxTokens)) : 2000;
       raw = await client.chatVision(prompt, images, model, maxTokens);
       failMsg = "";
       framesUsed = images.length; // 埋点：记录本轮真正送出去的帧数（可反推是否降档）
@@ -268,6 +281,10 @@ export async function generateAndWriteVideoSummary(
     upsertFmScalar(applySummaryToNote(data, summary, SUMMARY_V), "summary_style", style),
   );
 
+  // 第十四轮：输出截断读取——扩预算后仍 length 收尾（或钳制通道截断）时摘要是半成品，
+  // 但已有内容仍有效：status 保持 success、不触发失败重试链，errorMessage 记录事实、
+  // msg 并入截断信息提醒用户补跑（历史：截断结果落盘且 summary_v 已写，用户毫无感知）
+  const outputTruncated = client.lastResponseTruncated;
   const record: SummaryRecord = {
     notePath: file.path,
     sourceChars: input.transcript.length + input.framePaths.length,
@@ -276,6 +293,12 @@ export async function generateAndWriteVideoSummary(
     generatedAt: new Date().toISOString(),
     kind: "video_multimodal",
     framesUsed,
+    ...(outputTruncated ? { errorMessage: OUTPUT_TRUNCATED_HINT } : {}),
   };
-  return { ok: true, msg: "视频摘要已生成", model, record };
+  return {
+    ok: true,
+    msg: outputTruncated ? `视频摘要已生成（${OUTPUT_TRUNCATED_HINT}）` : "视频摘要已生成",
+    model,
+    record,
+  };
 }

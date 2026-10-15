@@ -149,6 +149,40 @@ export function sliceByCodePoints(s: string, max: number): string {
   return chars.length <= max ? s : chars.slice(0, max).join("");
 }
 
+/** headTailSlice 的中段省略标记（醒目、肉眼可辨；视频/图文两通道共用同一份）。 */
+export const HEAD_TAIL_OMITTED_MARK = "\n……（中段已省略）……\n";
+
+/**
+ * 截断明示句（拼进提示词，让模型知道中段缺失、严禁编造；视频/图文两通道共用同一口径）。
+ * 历史：头部截断（sliceByCodePoints）静默丢内容且提示词不明示——模型把截断结果当成完整
+ * 原文，长视频结尾的结论/recap 段直接消失，摘要在「总结与意义」节只能凭前文脑补。
+ */
+export const SOURCE_TRUNCATION_NOTICE =
+  "注意：原文过长，已仅保留开头与结尾，中段省略；严禁对未提供的中间内容做任何编造或填充。";
+
+/** headTailSlice 的返回：text 为拼装后的文本；truncated 标记是否发生了首尾截断。 */
+export interface HeadTailSliceResult {
+  text: string;
+  truncated: boolean;
+}
+
+/**
+ * 首尾保留式截断（第十四轮）：headTailSlice(text, headChars, tailChars)。
+ * 为什么不用 sliceByCodePoints 头部截断：长视频/长图文的结尾（结论、recap、总结段）是
+ * 最有价值的要点候选，头部截断会静默丢弃；改为「首 head + 中段省略标记 + 尾 tail」，
+ * 截断事实由调用方用 SOURCE_TRUNCATION_NOTICE 明示进提示词，模型据此不编造中段。
+ * 与 sliceByCodePoints 同口径：按码点切分（Array.from），emoji / 星体字符不会被代理对劈开。
+ * 长度 ≤ head+tail（含空串）原样返回且 truncated=false；某侧为 0 时该侧为空。
+ */
+export function headTailSlice(text: string, headChars: number, tailChars: number): HeadTailSliceResult {
+  const chars = Array.from(text ?? "");
+  if (chars.length <= headChars + tailChars) return { text, truncated: false };
+  const head = chars.slice(0, headChars).join("");
+  // 注意不能写 chars.slice(-tailChars)：tailChars=0 时 -0 即 0，会把全文当尾段拼回来
+  const tail = tailChars > 0 ? chars.slice(chars.length - tailChars).join("") : "";
+  return { text: head + HEAD_TAIL_OMITTED_MARK + tail, truncated: true };
+}
+
 export function parseList(text: string): string[] {
   return (text || "")
     .split(/[,\n，、]/)

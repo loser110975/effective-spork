@@ -10,6 +10,7 @@
 // 对外契约（第十一轮定稿；第十二轮增补：删除死导出 NUMERIC_RULE_FALLBACKS、
 // 数组一律按损坏处理——数组不是合法的 settings/state 容器；存储拆分轮增补 payloadNeedsRescue）：
 // - sanitizeNumericSettings 就地修改并返回同一对象；合法值原样保留（含数值的取整与钳制）；
+//   第十四轮增补：summaryMaxTokens 恰好等于旧默认 500 时在消毒路径迁移为新默认 2000（幂等）；
 // - needsBackupRescue「复合结构的 settings 不是非空对象即抢救」（旧 data.json 及其 .bak）；settings={} 视为存在；settings=数组 → 抢救；
 // - payloadNeedsRescue「单文件载荷非非空对象即损坏」（新布局 settings.json/state.json 逐文件抢救）；
 // - pickSettingsSource 按「settings 对象 / 损坏回默认 / 旧版扁平兼容」三规则挑合并来源
@@ -34,7 +35,7 @@ const NUMERIC_RULES: NumericRule[] = [
   { key: "maxImages", min: 1, max: 10, fallback: 10 },
   { key: "visionConcurrency", min: 1, max: 6, fallback: 3 },
   { key: "relatedNotesMax", min: 1, max: 30, fallback: 8 },
-  { key: "summaryMaxTokens", min: 200, max: 4000, fallback: 500 },
+  { key: "summaryMaxTokens", min: 200, max: 4000, fallback: 2000 },
   { key: "processRefreshMs", min: 1000, max: 5000, fallback: 5000 },
 ];
 
@@ -76,8 +77,21 @@ export function sanitizeNumericSettings(s: DouyinSyncSettings): DouyinSyncSettin
     const parsed = coerceInt(box[r.key]);
     box[r.key] = parsed === null ? r.fallback : clamp(parsed, r.min, r.max);
   }
+  // 第十四轮存量迁移：summaryMaxTokens 旧默认 500 → 新默认 2000。为什么必须放加载/消毒
+  // 路径而不是只改 DEFAULT_SETTINGS：存量实例的 500 早已持久化进 settings.json / data.json，
+  // 合并时默认值被存储值覆盖，只改默认对它们无效。为什么不做一次性迁移钩子：消毒每次
+  // load 都跑，值改写为 2000 后条件天然不再命中（幂等）；用户主动设置的 300 / 2500 等
+  // 非 500 合法值不命中，原样保留；恰好 === 500（旧默认）才视为「没动过的默认值」迁移。
+  if (box.summaryMaxTokens === SUMMARY_MAX_TOKENS_LEGACY_DEFAULT) {
+    box.summaryMaxTokens = SUMMARY_MAX_TOKENS_DEFAULT;
+  }
   return s;
 }
+
+/** summaryMaxTokens 旧默认（第十四轮迁移标记值）：消毒路径上恰好等于该值的存量被改写为新默认。 */
+export const SUMMARY_MAX_TOKENS_LEGACY_DEFAULT = 500;
+/** summaryMaxTokens 新默认（第十四轮）：与 NUMERIC_RULES fallback、DEFAULT_SETTINGS 三处同口径。 */
+export const SUMMARY_MAX_TOKENS_DEFAULT = 2000;
 
 /**
  * data.json 是否需要走备份抢救（第十一轮：条件从 `!data || (!data.settings && !data.state)`

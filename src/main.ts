@@ -7,7 +7,7 @@ import { SyncEngine, SyncSummary } from "./syncEngine";
 import { ProcessManager, type NotifyFn, type ProcResult } from "./processManager";
 import { StatusHub } from "./statusHub";
 import { DouyinSyncPanelView, VIEW_TYPE_DOUYIN_PANEL, type PanelHost } from "./panelView";
-import { OcrResultModal, ocrWithFallback, pickImageFile, pushVisionRecord, readImageAsDataUrl, setOcrApp } from "./ocrService";
+import { OcrResultModal, runOcr, pickImageFile, pushVisionRecord, readImageAsDataUrl } from "./ocrService";
 import { pushSummaryRecord } from "./statusCore";
 import { generateSummaryForFile } from "./summaryService";
 import { statusVisual } from "./statusCore";
@@ -97,7 +97,6 @@ export default class DouyinSyncPlugin extends Plugin {
         return s ? path.dirname(s) : this.manifest.dir || "";
       },
     });
-    setOcrApp(this.app);
 
     this.statusBarEl = this.addStatusBarItem();
     this.statusBarEl.addClass("douyin-sync-status");
@@ -435,7 +434,7 @@ export default class DouyinSyncPlugin extends Plugin {
     return candidates[0] ?? "";
   }
 
-  /** 图片 OCR：选择 → 校验 → 主通道 →（失败且开关开启）显式确认 → 付费兜底 → 展示。 */
+  /** 图片 OCR：选择 → 校验 → 主通道识别 → 展示。 */
   async openOcr(): Promise<void> {
     if (!this.settings.ocrPanelEnabled) {
       new Notice("图片 OCR 已在设置中关闭");
@@ -453,11 +452,11 @@ export default class DouyinSyncPlugin extends Plugin {
         return;
       }
       new Notice("识别中…");
-      const out = await ocrWithFallback(this.settings, read.dataUrl, file.name, "");
+      const out = await runOcr(this.settings, read.dataUrl, file.name, "");
       this.engine.state.vision = pushVisionRecord(this.engine.state.vision, {
         imagePath: file.name,
-        channel: out.channel,
-        status: out.ok ? "success" : out.declinedFallback ? "awaiting_confirm" : "failed",
+        channel: "primary",
+        status: out.ok ? "success" : "failed",
         text: out.text,
         errorCode: out.errorCode,
         elapsedMs: out.elapsedMs,
@@ -466,12 +465,12 @@ export default class DouyinSyncPlugin extends Plugin {
       await this.saveSettings();
       if (!out.ok) {
         new Notice(
-          `识别失败${out.declinedFallback ? "（已取消付费通道）" : ""}${out.errorCode ? `（错误码 ${out.errorCode}）` : ""}${out.error ? `：${out.error}` : ""}`,
+          `识别失败${out.errorCode ? `（错误码 ${out.errorCode}）` : ""}${out.error ? `：${out.error}` : ""}`,
           8000,
         );
         return;
       }
-      new OcrResultModal(this.app, out.text, out.channel, out.modelUsed ?? "").open();
+      new OcrResultModal(this.app, out.text, out.modelUsed ?? "").open();
     } catch (e: any) {
       // 命令入口兜底（复审 P2）：异常冒泡只会变成无反馈的 unhandled rejection
       new Notice(`图片识别异常：${String(e?.message ?? e).slice(0, 150)}`, 8000);

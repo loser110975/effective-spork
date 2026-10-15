@@ -67,7 +67,7 @@ export interface DouyinSyncSettings {
   videoSummaryModel: string;
   /** 摘要风格预设（写入 frontmatter summary_style；切换不自动重出旧摘要） */
   videoSummaryStyle: SummaryStyle;
-  /** 多模态总结专用通道（留空复用 aiBaseUrl/aiKey）：便于独立接入智谱 GLM 等服务，隔离分类通道 */
+  /** 多模态总结专用通道（必填；2026-10-15 起不再回退 aiBaseUrl/aiKey）：便于独立接入智谱 GLM 等服务，隔离分类通道 */
   videoSummaryBaseUrl: string;
   videoSummaryApiKey: string;
   /** 抽帧间隔（秒）：每隔 N 秒抽一帧，按视频时长自适应（23 秒≈3 帧，10 分钟≈60 帧），上限 100 张 */
@@ -86,9 +86,9 @@ export interface DouyinSyncSettings {
   relatedNotesEnabled: boolean;
   /** 每篇笔记最多互链条数（1~30） */
   relatedNotesMax: number;
-  /** OCR 视觉通道独立基址（留空复用 aiBaseUrl）。用于把 OCR 从过载通道隔离出来 */
+  /** OCR 视觉通道独立基址（必填；2026-10-15 起不再回退 aiBaseUrl）。用于把 OCR 从过载通道隔离出来 */
   visionBaseUrl: string;
-  /** OCR 视觉通道独立 Key（留空复用 aiKey / dashscopeKey） */
+  /** OCR 视觉通道独立 Key（必填；2026-10-15 起不再回退 aiKey / dashscopeKey） */
   visionApiKey: string;
   /**
    * OCR 全局并发上限（跨条目统一限流）。
@@ -115,13 +115,10 @@ export interface DouyinSyncSettings {
   processRefreshMs: number;
   /** 图片 OCR 独立入口（F2） */
   ocrPanelEnabled: boolean;
-  /** OCR 主通道（Agnes）基址与 Key；Key 留空回退 aiKey */
+  /** OCR 主通道（Agnes）基址与 Key（2026-10-15 起各自独立必填，不再回退 aiKey） */
   ocrBaseUrl: string;
   ocrApiKey: string;
   ocrModelPrimary: string;
-  ocrModelFallback: string;
-  /** 付费兜底开关（经中间确认）：true＝允许在主通道失败后弹确认、经用户同意才调用；false＝完全不使用付费通道 */
-  ocrFallbackEnabled: boolean;
   /** AI 摘要（F3） */
   summaryEnabled: boolean;
   summaryMaxTokens: number;
@@ -192,9 +189,9 @@ export const DEFAULT_SETTINGS: DouyinSyncSettings = {
   ocrBaseUrl: "https://api.agnes-ai.cn/v1",
   ocrApiKey: "",
   ocrModelPrimary: "agnes-2.5-flash",
-  // 注意：裸名 qwen3-vl-plus 已不在百炼有额度列表（FreeTierOnly 403），与 videoSummaryModel 同口径（复审 P2）
-  ocrModelFallback: "qwen3-vl-plus-2025-12-19",
-  ocrFallbackEnabled: true,
   summaryEnabled: true,
-  summaryMaxTokens: 500,
+  // 第十四轮 500→2000：旧默认下结构化长摘要常被 max_tokens 拦腰截断（finish_reason=length
+  // 实测高发），截断结果落盘且 summary_v 已写、永不重出。存量实例已持久化的 500 由
+  // settingsSanitize 的加载迁移改写（恰好等于旧默认才迁移，用户自设的其他合法值不动）。
+  summaryMaxTokens: 2000,
 };

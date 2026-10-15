@@ -12,8 +12,10 @@ import * as typesMod from "../src/types/domain";
 import * as typesSettingsMod from "../src/types/settings";
 import * as aiConfigMod from "../src/aiConfig";
 import * as videoSummaryServiceMod from "../src/videoSummaryService";
+import * as summaryServiceMod from "../src/summaryService";
 import * as relatedNotesMod from "../src/relatedNotes";
-import { sanitizeNumericSettings, needsBackupRescue, pickSettingsSource, fallbackMatchesDefaults, payloadNeedsRescue } from "../src/settingsSanitize";
+import { sanitizeNumericSettings, needsBackupRescue, pickSettingsSource, fallbackMatchesDefaults, payloadNeedsRescue, SUMMARY_MAX_TOKENS_LEGACY_DEFAULT, SUMMARY_MAX_TOKENS_DEFAULT } from "../src/settingsSanitize";
+import { AiClient, OUTPUT_TRUNCATED_HINT } from "../src/ai";
 import { PluginFileStore, SETTINGS_FILE, STATE_FILE } from "../src/pluginStorage";
 import { SyncEngine } from "../src/syncEngine";
 import { MediaStore } from "../src/media";
@@ -33,6 +35,7 @@ export const m = {
   ...typesSettingsMod,
   ...aiConfigMod,
   ...videoSummaryServiceMod,
+  ...summaryServiceMod,
   ...relatedNotesMod,
   SyncEngine,
   MediaStore,
@@ -44,6 +47,10 @@ export const m = {
   pickSettingsSource,
   fallbackMatchesDefaults,
   payloadNeedsRescue,
+  SUMMARY_MAX_TOKENS_LEGACY_DEFAULT,
+  SUMMARY_MAX_TOKENS_DEFAULT,
+  AiClient,
+  OUTPUT_TRUNCATED_HINT,
   PluginFileStore,
   SETTINGS_FILE,
   STATE_FILE,
