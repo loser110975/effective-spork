@@ -679,6 +679,9 @@ export default class DouyinSyncPlugin extends Plugin {
       // 互斥命中是「时机不对」不是故障：给出明确出路（2026-10-16 截图实测「语义索引失败：同步正在进行中」）
       if (/同步正在进行中/.test(msg)) {
         this.showResult("同步正在进行中，索引暂不能构建——这轮同步/补录结束后再点一次；常规同步收尾也会自动增量更新索引", true);
+      } else if (/额度已耗尽/.test(msg)) {
+        // 配额类已是完整中文指引（引擎侧组装），原样展示不截断不加工
+        this.showResult(msg, true);
       } else {
         this.showResult(`语义索引失败：${msg.slice(0, 150)}`, true);
       }

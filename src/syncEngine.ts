@@ -1597,14 +1597,34 @@ export class SyncEngine {
         todo.push({ id: c.id, text, hash });
       }
       let done = 0;
-      for (let i = 0; i < todo.length; i += 10) {
-        const batch = todo.slice(i, i + 10);
-        const vecs = await this.embedClient.embed(batch.map((b) => b.text));
-        for (let j = 0; j < batch.length; j++) {
-          vs.set(batch[j].id, batch[j].hash, new Float32Array(vecs[j]));
+      try {
+        for (let i = 0; i < todo.length; i += 10) {
+          const batch = todo.slice(i, i + 10);
+          const vecs = await this.embedClient.embed(batch.map((b) => b.text));
+          for (let j = 0; j < batch.length; j++) {
+            vs.set(batch[j].id, batch[j].hash, new Float32Array(vecs[j]));
+          }
+          done += batch.length;
+          onProgress?.(`语义索引：已向量化 ${done}/${todo.length}`);
         }
-        done += batch.length;
-        onProgress?.(`语义索引：已向量化 ${done}/${todo.length}`);
+      } catch (e: any) {
+        // 中途失败（典型：配额耗尽 HTTP 400，2026-10-16 实测）：先 persist 已成功批次——
+        // 已付费的向量不丢，下轮重跑 hash 增量只补缺口，不重复计费
+        try {
+          await vs.persist();
+        } catch {
+          /* persist 失败不影响原错误冒泡 */
+        }
+        const raw = String(e?.message ?? e);
+        if (isQuotaExhaustedError(raw)) {
+          throw new Error(
+            `embedding 免费额度已耗尽（当前模型 ${this.settings.embeddingModel}）。两条出路：` +
+              `① 百炼控制台充值开付费（全量 1100 篇约 1~2 元）；` +
+              `② 设置页「语义检索」换有免费额度的模型——硅基流动 BAAI/bge-m3 免费：` +
+              `Base URL 填 https://api.siliconflow.cn/v1、Key 填 SiliconFlow Key、模型填 BAAI/bge-m3（换模型自动全量重算）`,
+          );
+        }
+        throw e;
       }
       const pruned = vs.pruneExcept(new Set(candidates.map((c) => c.id)));
       await vs.persist();

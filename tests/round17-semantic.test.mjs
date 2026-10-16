@@ -545,6 +545,34 @@ export function runTests(m) {
         const md = await vault.read(vault.getAbstractFileByPath("抖音/收藏/未分类/n1.md"));
         t("移动失败：fm category 回滚不留中间态", /category: "?未分类"?/.test(md) && !/category: "?AI 编程"?/.test(md));
       }
+      // ⑥' buildSemanticIndex 配额耗尽：友好文案 + 已成功批次落盘（不白付费）
+      {
+        const vault = new MiniVault(m.TFile, m.TFolder);
+        for (let i = 0; i < 11; i++) {
+          const n = { id: `q${i}`, title: `配额测试${i}`, body: `配额测试笔记${i}：语义索引配额耗尽场景内容块 ${i}` };
+          vault.files.set(`抖音/收藏/AI 编程/q${i}.md`, { data: noteMarkdown(n), size: 0, mtime: 0 });
+        }
+        const { engine } = makeEngine(m, vault, { embeddingApiKey: "sk-test" });
+        const app = { vault };
+        seedCache(app);
+        engine.app = app;
+        const vs = new m.VectorStore(vault.adapter, "plugdir");
+        engine.attachVectorStore(vs);
+        let callN = 0;
+        m.EmbeddingClient.prototype.embed = async (inputs) => {
+          callN++;
+          if (callN >= 2) throw new Error('embedding HTTP 400: {"error":{"message":"Free quota exhausted. To continue accessing the model on a paid basis, please add funds"}}');
+          return inputs.map(() => [0.5, 0.5]);
+        };
+        let threw = "";
+        try {
+          await engine.buildSemanticIndex();
+        } catch (e) {
+          threw = String(e.message ?? e);
+        }
+        t("配额耗尽：友好中文文案含两条出路（充值/换 bge-m3）", threw.includes("额度已耗尽") && threw.includes("bge-m3"));
+        t("配额耗尽：已成功批次（首批 10 条）向量已落盘", vs.size() === 10 && vault.kv.has("plugdir/vectors.json"));
+      }
     });
   }
 
