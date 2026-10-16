@@ -216,7 +216,8 @@ export function runTests(m) {
       const hierarchy = buildPrompt({ ...base, style: "hierarchy" });
       const outline = buildPrompt({ ...base, style: "outline" });
       const qa = buildPrompt({ ...base, style: "qa" });
-      t("hierarchy 含 v3 结构标记（引言/AI 总结/总结与意义）", hierarchy.includes("## 引言") && hierarchy.includes("## AI 总结") && hierarchy.includes("## 总结与意义"));
+      // 批次二 v4（2026-10-16 禁叠层）：AI 总结独立收尾节移除，总结与意义成为唯一总结层
+      t("hierarchy 含 v4 结构标记（引言/总结与意义，无 AI 总结）", hierarchy.includes("## 引言") && !hierarchy.includes("## AI 总结") && hierarchy.includes("## 总结与意义"));
       t("outline 含要点结构（核心观点/要点/值得记住）", outline.includes("## 核心观点") && outline.includes("## 要点") && outline.includes("## 值得记住"));
       t("qa 含问答结构（Q:/一句话总结）", qa.includes("**Q:") && qa.includes("## 一句话总结"));
       t("方法论四条对全风格生效", [hierarchy, outline, qa].every((p) => p.includes("画面信息挖掘") && p.includes("转录校正") && p.includes("诚实原则") && p.includes("时间脉络")));

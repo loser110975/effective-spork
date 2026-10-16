@@ -7,8 +7,9 @@ import { MediaStore } from "./media";
 import { VideoMediaStore, VideoAssets, isDeterministicMediaError, type MediaErrorKind } from "./videoMedia";
 import { generateBases } from "./bases";
 import { buildNote, planNotePath } from "./noteBuilder";
-import { generateAndWriteVideoSummary, listVideoFramePaths, SUMMARY_V } from "./videoSummaryService";
-import { extractSummarySources, collectExistingAssets, applySummaryToNote, frontmatterBlock, pushSummaryRecord, upsertOcrRowsToCallout, type ReusedNoteAssets } from "./statusCore";
+import { generateAndWriteVideoSummary, listVideoFramePaths } from "./videoSummaryService";
+import { extractSummarySources, collectExistingAssets, applySummaryToNote, frontmatterBlock, pushSummaryRecord, upsertOcrRowsToCallout, upsertFmScalar, type ReusedNoteAssets } from "./statusCore";
+import { ensureFolder } from "./media";
 import { applyRelatedToNote, buildRelatedBlock, pickRelatedLinks, type RelatedCandidate, type RelatedLink } from "./relatedNotes";
 import type { DouyinSyncSettings } from "./types/settings";
 import type { SyncState } from "./types/state";
@@ -16,7 +17,7 @@ import type { SyncItem, DouyinAwemeRaw, ItemSource } from "./types/domain";
 import { SOURCE_LABEL } from "./types/domain";
 import type { AsrResult } from "./types/asr";
 import type { StageTimings } from "./types/state";
-import { nowIso, parseList, noteTitleFor, sleep } from "./util";
+import { nowIso, parseList, noteTitleFor, sleep, sliceByCodePoints } from "./util";
 import { isAudioOnlyItem, AUDIO_ONLY_REASON } from "./itemType";
 import { clampConcurrency, mapLimit, Semaphore } from "./concurrency";
 import { detailStageTimings, summarizeStageTimings, StageTimer } from "./perf";
@@ -41,6 +42,13 @@ export interface SyncSummary {
   notices: string[];
   startedAt: string;
   finishedAt: string;
+}
+
+/** 补录链单轮计数出参（批次二 G）：backfillVision / backfillVideos 的可选 out 参数，
+ *  供 backfillAll 循环终止判定与累计统计；返回字符串形态不变，既有调用方零改动。 */
+export interface BackfillTally {
+  done: number;
+  failed: number;
 }
 
 // ---------- processItem 管线的阶段产物类型（2026-09-27 第七轮拆分，字段即拆分前的局部变量） ----------
@@ -781,12 +789,14 @@ export class SyncEngine {
         asrReused = true;
       }
 
-      // F2（第十轮）：撞库路径已有当前版本摘要时跳过阶段 9 重出。摘要回填（阶段 8）刚把
+      // F2（第十轮）：撞库路径已有摘要且格式健康时跳过阶段 9 重出。摘要回填（阶段 8）刚把
       // 既有摘要写回笔记，若无门控，阶段 9 会立刻用现生成版本覆盖——重置状态后重同步会把
       // 不可再生的精修摘要整批替换掉（328 篇 Agent 亲写层级体），且这是一次纯浪费的付费调用。
+      // 存量保护（批次二 v4 升版）：判定从「=== SUMMARY_V」放宽为「>= 3 即格式健康」——
+      // 否则升 v4 后 v3 笔记在撞库路径会被整批重写成 v4，违反「存量不自动重出」（2026-10-16 拍板）。
       // 只保护「转录来自复用源」的路径：转录确实变化时（重新转写）照常重出。
       const keepExistingSummary =
-        asrReused && !!reused?.summaryText && parseInt(reused.summaryV, 10) === SUMMARY_V;
+        asrReused && !!reused?.summaryText && parseInt(reused.summaryV, 10) >= 3;
 
       // 阶段 2：封面
       const coverPath = await this.resolveCover(item, reused);
@@ -1710,9 +1720,17 @@ export class SyncEngine {
    * 关键帧数少于当前设置（补帧）。已有成功转录的直接复用，不重复调用 ASR。
    * 预算复用 maxTranscribePerSync。
    */
-  async backfillVideos(onProgress?: (text: string) => void, opts?: { zeroAsrBudget?: boolean }): Promise<string> {
+  async backfillVideos(
+    onProgress?: (text: string) => void,
+    opts?: { zeroAsrBudget?: boolean },
+    out?: BackfillTally, // 批次二 G 可选出参：本轮 done / failed（返回字符串形态不变，见 backfillVision 注释）
+  ): Promise<string> {
     if (this.running) throw new Error("同步正在进行中");
     this.running = true;
+    if (out) {
+      out.done = 0;
+      out.failed = 0;
+    }
     const summary = newSyncSummary();
     try {
       this.refreshClients(); // 同 syncAll：按最新设置重建 AI 客户端
@@ -1779,13 +1797,16 @@ export class SyncEngine {
       // 设置不一致不再触发自动重抽——帧网格存在、或已按某个间隔尝试过（storedInterval>0）
       // 即视为完成，复用时回写保持原值。只有从未抽过帧（无帧文件且无 frame_interval 记录）
       // 才按当前设置补抽；全量强制重抽走命令面板的 forceFrameResync 一次性标志。
-      // 摘要按 summary_v 版本号判断（v3 = 层级笔记体），格式升级会重出。
       const framePaths = listVideoFramePaths(this.app.vault, this.settings.mediaFolder, id);
       const storedInterval = parseInt((fm.match(/^frame_interval:\s*(\d+)\s*$/m) ?? [])[1] ?? "0", 10) || 0;
       const framesOk = framePaths.length > 0 || storedInterval > 0;
-      const summaryV3 = /^summary_v:\s*3\s*$/m.test(fm);
+      // 摘要格式健康判定（批次二 v4 升版，2026-10-16 拍板）：summary_v >= 3 即健康——
+      // 升 v4 只改「写法」（一行式哨兵 / 单总结层 / ≤600 字）不改「判定」，v3 存量摘要
+      // 不因升版被批量重出（584 篇存量内容不动），只有无摘要块的笔记进补跑候选。
+      const summaryVStored = parseInt((fm.match(/^summary_v:\s*(\d+)\s*$/m) ?? [])[1] ?? "0", 10) || 0;
+      const summaryFormatOk = summaryVStored >= 3;
       // 强制重抽轮（forceFrameResync）：跳过判定整体失效，所有视频笔记都进候选集
-      if (!forceResync && transcriptTerminal && hasSummary && framesOk && summaryV3) {
+      if (!forceResync && transcriptTerminal && hasSummary && framesOk && summaryFormatOk) {
         skipped++;
         continue;
       }
@@ -1876,6 +1897,10 @@ export class SyncEngine {
       this.state.forceFrameResync = false;
     }
     await this.saveState();
+    if (out) {
+      out.done = done;
+      out.failed = failed;
+    }
     // zeroAsrBudget 自动链静默语义：本轮没有任何实际工作（全健康/无候选）→ 空串不弹 Notice
     if (opts?.zeroAsrBudget && done === 0 && failed === 0) return "";
     const parts = [`补跑完成：处理 ${done}，跳过 ${skipped}，失败 ${failed}`];
@@ -1895,9 +1920,16 @@ export class SyncEngine {
    * 候选上限 VISION_BACKFILL_CAP 条/轮；失败计数复用 backfillFails（连续 ≥3 跳过，防死循环）。
    * 消费方：同步收尾自动补录（main.runSync）、命令/面板「补录图文 OCR」、批次二全量存量补录。
    * 返回给用户看的一句话；空串 = 无事发生（未启用 / 未配置 / 无缺口），调用方静默。
+   * out（批次二 G 可选出参）：本轮 done / failed 计数——backfillAll 循环终止与累计统计用，
+   * 返回字符串形态不变，既有调用方（runSync 自动链 / 命令）零改动。
    */
-  async backfillVision(onProgress?: (text: string) => void): Promise<string> {
+  async backfillVision(onProgress?: (text: string) => void, out?: BackfillTally): Promise<string> {
     if (this.running) throw new Error("同步正在进行中");
+    // out 归零放在所有 return 之前：门未通（未启用）的早退路径也要把计数复位为 0/0
+    if (out) {
+      out.done = 0;
+      out.failed = 0;
+    }
     if (!this.settings.enableVision) return "";
     this.running = true;
     try {
@@ -2004,10 +2036,260 @@ export class SyncEngine {
         if (this.state.backfillFails) delete this.state.backfillFails[id];
       }
       await this.saveState();
+      if (out) {
+        out.done = done;
+        out.failed = failed;
+      }
       if (done === 0 && failed === 0) return ""; // 无缺口 / 全健康 → 静默
       const parts = [`图文 OCR 补录：处理 ${done}，失败 ${failed}，健康 ${healthy}`];
       if (errors.length) parts.push(`注意：${errors[0]}`);
       return parts.join("。");
+    } finally {
+      this.running = false;
+    }
+  }
+
+  // ---------- 批次二维护命令（2026-10-16）：未分类补跑 AI 分类 / folder 错位修复 ----------
+
+  /** 分类补跑上限（条/轮）：一次点击跑完 500+ 篇未分类既打爆 AI 通道也让 Notice 失去意义。 */
+  private static readonly RECATEGORIZE_CAP = 50;
+
+  /**
+   * 未分类笔记补跑 AI 分类（批次二 C）：
+   * 遍历 processed 台账 → frontmatter category 为空 / 「未分类」的笔记 → 用「fm title +
+   * 正文 OCR 文本 / 逐字稿」作分类输入调 AI → ①fm category 回填 ②移动文件到
+   * <rootFolder>/<新分类>/<原文件名> ③台账 processed[id].path 同步 + 反向索引失效。
+   * 「其他（不好分类）」或 AI 失败：frontmatter 保持未分类不动，不计失败（下轮命令再跑）；
+   * 失败计数复用 backfillFails（连续 ≥3 跳过，与 backfillVideos / backfillVision 同口径）。
+   * 返回给用户看的一句话汇总；门未通（未启用分类 / 通道未配置）返回说明文案。
+   */
+  async recategorizeUncategorized(onProgress?: (text: string) => void): Promise<string> {
+    if (this.running) throw new Error("同步正在进行中");
+    this.running = true;
+    try {
+      this.refreshClients(); // 与 syncAll / 补跑同口径：按最新设置重建 AI 客户端
+      if (!this.settings.enableCategory || !this.ai) {
+        return "AI 分类未启用或通道未配置（请开启「AI 分类」并配置通用 AI Key）";
+      }
+      const cats = parseList(this.settings.aiCategories);
+      if (cats.length === 0) {
+        return "AI 分类未启用或通道未配置（分类列表为空，请在设置中填写）";
+      }
+      const CAP = SyncEngine.RECATEGORIZE_CAP;
+      let candidates = 0;
+      let done = 0;
+      let failed = 0;
+      let skipped = 0;
+      const bumpFail = (id: string) => {
+        this.state.backfillFails ??= {};
+        this.state.backfillFails[id] = (this.state.backfillFails[id] ?? 0) + 1;
+      };
+      for (const [id, entry] of Object.entries(this.state.processed)) {
+        if (candidates >= CAP) break;
+        // 连续失败 ≥3 的条目本轮跳过（防死循环，与补跑/OCR 补录同口径）
+        if ((this.state.backfillFails?.[id] ?? 0) >= 3) {
+          skipped++;
+          continue;
+        }
+        const currentPath = this.findNotePath(id) ?? entry?.path;
+        if (!currentPath) continue;
+        const file = this.app.vault.getAbstractFileByPath(normalizePath(currentPath));
+        if (!(file instanceof TFile)) continue;
+        let content: string;
+        try {
+          content = await this.app.vault.read(file);
+        } catch {
+          continue;
+        }
+        // 候选判定：frontmatter category 为空或「未分类」（引号无关，与 buildNote 的 yamlStr 写回口径一致）
+        const fm = frontmatterBlock(content);
+        const curCategory = (fm.match(/^category:\s*"?([^"\n]*)"?\s*$/m) ?? [])[1]?.trim() ?? "";
+        if (curCategory && curCategory !== "未分类") continue;
+        candidates++;
+        onProgress?.(`分类补跑：已处理 ${done + failed}/${CAP}`);
+        // 分类输入与同步路径 categorizeItem 同构：标题 + 描述（OCR 文本代） + 逐字稿摘录
+        //（categorize 内部自带 desc 300 / transcript 800 的码点截断，这里只做去空行整形）
+        const title = (fm.match(/^title:\s*"?([^"\n]*)"?\s*$/m) ?? [])[1]?.trim() || file.basename;
+        const { transcript, ocrText } = extractSummarySources(content);
+        const desc = ocrText.replace(/\s+/g, " ").trim();
+        let newCategory: string;
+        try {
+          newCategory = await this.ai.categorize(cats, title, desc, transcript);
+        } catch (e: any) {
+          failed++;
+          bumpFail(id);
+          continue;
+        }
+        // 「其他（不好分类）」/ 空 / 未分类：保持现状不动，不计失败（下轮命令再跑）
+        if (!newCategory || newCategory === "未分类" || newCategory === "其他（不好分类）") continue;
+        try {
+          // ① fm category 回填（先改内容后移动：vault.process 需要 TFile 引用，移动后旧引用失效）
+          await this.app.vault.process(file, (data) => upsertFmScalar(data, "category", newCategory));
+          // ② 移动文件到 <rootFolder>/<新分类>/<原文件名>（目录不存在则逐级创建；
+          //    fileManager.renameFile 是 Obsidian 的移动原语，链接与索引随动）
+          const target = normalizePath(`${this.settings.rootFolder}/${newCategory}/${file.name}`);
+          const parentIdx = target.lastIndexOf("/");
+          await ensureFolder(this.app.vault, parentIdx > 0 ? target.slice(0, parentIdx) : "/");
+          await this.app.fileManager.renameFile(file, target);
+          // ③ 台账与反向索引同步（findNotePath 三层兜底之一就是索引，不更新会在旧路径重建出重复笔记）
+          this.state.processed[id].path = target;
+          this.noteIndexGet().set(id, target);
+          done++;
+          if (this.state.backfillFails) delete this.state.backfillFails[id];
+        } catch (e: any) {
+          failed++;
+          bumpFail(id);
+        }
+      }
+      await this.saveState();
+      if (candidates === 0) {
+        return skipped > 0 ? `无未分类笔记（另有 ${skipped} 条连续失败被跳过）` : "无未分类笔记";
+      }
+      return `分类补跑：处理 ${done}，失败 ${failed}，跳过 ${skipped}`;
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /**
+   * folder 字段错位修复（批次二 D）：
+   * 候选 = processed 台账中「笔记实际所在目录（路径父段，且路径含 rootFolder/）≠ frontmatter
+   * folder」的收藏类笔记——实际目录非「未分类」而 fm folder 为「未分类」/ 空是典型错位
+   * （分类回填移动过文件）；台账 entry.folder 与实际目录不符的同样以实际目录为准统一修正。
+   * 修复动作：①fm folder 回填为实际目录名 ②正文「来源」行内的（未分类）原位替换为
+   * （实际目录名），其余文案逐字保留 ③台账 processed[id].folder 同步（防补跑再写错）。
+   * ⚠️ 只修 folder 语义字段与来源行，绝不移动文件、绝不碰 category。无错位时返回明确文案。
+   */
+  async fixFolderMismatch(onProgress?: (text: string) => void): Promise<string> {
+    if (this.running) throw new Error("同步正在进行中");
+    this.running = true;
+    try {
+      let fixed = 0;
+      let checked = 0;
+      const rootPrefix = `${this.settings.rootFolder}/`;
+      for (const [id, entry] of Object.entries(this.state.processed)) {
+        const currentPath = this.findNotePath(id) ?? entry?.path;
+        if (!currentPath) continue;
+        // 只处理 rootFolder 之下的笔记（路径前缀含 rootFolder/），库外笔记不碰
+        const relIdx = currentPath.indexOf(rootPrefix);
+        if (relIdx < 0) continue;
+        const rel = currentPath.slice(relIdx + rootPrefix.length);
+        const slashIdx = rel.lastIndexOf("/");
+        if (slashIdx <= 0) continue;
+        const actualDir = rel.slice(0, slashIdx).split("/").pop() ?? "";
+        if (!actualDir || actualDir === "未分类") continue; // 实际目录是「未分类」→ 不反向改写
+        const file = this.app.vault.getAbstractFileByPath(normalizePath(currentPath));
+        if (!(file instanceof TFile)) continue;
+        let content: string;
+        try {
+          content = await this.app.vault.read(file);
+        } catch {
+          continue;
+        }
+        checked++;
+        onProgress?.(`folder 错位修复：已修正 ${fixed}`);
+        const fm = frontmatterBlock(content);
+        // 引号无关读取 fm folder（processFrontMatter 写回后引号会被剥掉）
+        const fmFolder = (fm.match(/^folder:\s*"?([^"\n]*)"?\s*$/m) ?? [])[1]?.trim() ?? "";
+        // 错位 = 实际目录 ≠ fm folder（覆盖两种情形：fm=未分类/空，或 fm=别的收藏夹名但目录已变）
+        if (fmFolder === actualDir) continue;
+        // ① fm folder 回填为实际目录名
+        await this.app.vault.process(file, (data) => upsertFmScalar(data, "folder", actualDir));
+        // ② 正文「来源」行同步：noteBuilder 的元信息行是「作者：xx ｜ 来源：收藏（夹名） ｜ 链接」——
+        //    来源不一定在行首，按「行内含 `来源：`」定位，只把该行内的（未分类）替换为（实际目录名），
+        //    行内其余文案与所有其他行逐字保留；无（未分类）括注时替换零命中、内容零改动
+        if (content.includes("来源：") && /（未分类）/.test(content.split("\n").filter((l) => l.includes("来源：")).join("\n"))) {
+          await this.app.vault.process(file, (data) =>
+            data.replace(/^.*来源：.*$/gm, (line) => line.replace(/（未分类）/g, `（${actualDir}）`)),
+          );
+        }
+        // ③ 台账同步修正（processed[id].folder 不改的话，补跑重建路径会按旧 folder 再写错一次）
+        if (entry) entry.folder = actualDir;
+        fixed++;
+      }
+      await this.saveState();
+      return fixed === 0 ? "无 folder 错位" : `folder 错位修复：修正 ${fixed}（检查 ${checked}）`;
+    } finally {
+      this.running = false;
+    }
+  }
+
+  // ---------- 全量补录执行器（批次二 G，2026-10-16）----------
+
+  /** 全量补录总轮数硬顶：60 轮 ≈ 60×(OCR 30 + 转写预算) 条，防「计数失灵 → 活锁」的最后保险。 */
+  private static readonly BACKFILL_ALL_MAX_ROUNDS = 60;
+
+  /**
+   * 全量补录执行器（批次二 G）：循环执行「图文 OCR 补录 + 视频摘要补跑」两链直至无缺口。
+   * 背景：存量缺口 526 篇无摘要 + 图文全库 OCR=0，两链单轮上限（30 条 / 转写预算）跑不完，
+   * 手动点命令要几十次——本方法在整个循环期间持有 running 互斥，一次调用跑到底。
+   * 预算语义：backfillVideos 走默认预算模式（不传 zeroAsrBudget）——全量补录允许为
+   * 无转录的老视频付转写费，这正是「全量」的拍板语义。
+   * 终止条件：
+   * ① 正常收尾：一整轮两链都零工作量（done+failed 全为 0）= 无缺口可补；
+   * ② 配额自愈：摘要链连续 3 轮配额熔断（quotaDead 每轮由 backfillVideos 复位后重新探测，
+   *    连续置位 = 额度确实未恢复）→ 提前终止并注明疑似配额耗尽——继续循环只会白付
+   *    「摘要永远写不出来」的重写成本；
+   * ③ 硬顶 60 轮：计数逻辑万一失灵时的活锁保险。
+   * 每轮结束 saveState（节流窗口崩溃也不丢已补条目）+ onProgress 汇报累计。
+   */
+  async backfillAll(onProgress?: (text: string) => void): Promise<string> {
+    if (this.running) throw new Error("同步正在进行中");
+    this.running = true;
+    try {
+      const MAX_ROUNDS = SyncEngine.BACKFILL_ALL_MAX_ROUNDS;
+      const QUOTA_ZERO_ROUNDS = 3;
+      let totalOcr = 0;
+      let totalSummary = 0;
+      let round = 0;
+      let quotaStreak = 0;
+      let stopReason = "";
+      while (round < MAX_ROUNDS && !stopReason) {
+        round++;
+        const ocrOut: BackfillTally = { done: 0, failed: 0 };
+        const sumOut: BackfillTally = { done: 0, failed: 0 };
+        // 两链自带 running 互斥门；backfillAll 全程持有互斥，这里仅在同步前缀瞬间放行——
+        // JS 单线程下从放行到链自身重新置位之间没有 await，其他命令插不进来；
+        // 链的 finally 释放后由本方法的 finally 立即夺回，轮间 saveState 期间互斥仍在手
+        this.running = false;
+        try {
+          await this.backfillVision(onProgress, ocrOut);
+        } finally {
+          this.running = true;
+        }
+        this.running = false;
+        try {
+          await this.backfillVideos(onProgress, undefined, sumOut); // 默认预算模式：全量语义允许付转写费
+        } finally {
+          this.running = true;
+        }
+        totalOcr += ocrOut.done;
+        totalSummary += sumOut.done;
+        await this.saveState();
+        onProgress?.(`全量补录：已补 OCR ${totalOcr} / 摘要 ${totalSummary}，第 ${round} 轮`);
+        // 终止①：正常收尾——一整轮两链零工作量
+        if (ocrOut.done + ocrOut.failed === 0 && sumOut.done + sumOut.failed === 0) {
+          stopReason = "";
+          break;
+        }
+        // 终止②：配额熔断自愈——quotaDead 每轮由 backfillVideos 复位后重新探测，连续置位
+        // = 额度确实未恢复。注意不看 sumOut.done：熔断轮内 processItem 仍会重写成功（done>0）
+        // 但摘要一条也写不出来（runVideoSummary 对全条目 early-return），继续循环只是
+        // 「摘要恒缺 → 候选恒在 → 反复重写」的活锁，按摘要链零产出提前终止
+        if (this.videoSummaryQuotaDead) {
+          quotaStreak++;
+          if (quotaStreak >= QUOTA_ZERO_ROUNDS) {
+            stopReason = `连续 ${quotaStreak} 轮摘要链配额熔断零产出，疑似配额耗尽，已提前终止（额度恢复后可再次执行）`;
+          }
+        } else {
+          quotaStreak = 0;
+        }
+      }
+      if (!stopReason && round >= MAX_ROUNDS) {
+        stopReason = `已达总轮数上限 ${MAX_ROUNDS} 轮，如仍有缺口请再次执行`;
+      }
+      const head = `全量补录完成：OCR ${totalOcr} 条，摘要 ${totalSummary} 条，总轮数 ${round}`;
+      return stopReason ? `${head}（${stopReason}）` : head;
     } finally {
       this.running = false;
     }

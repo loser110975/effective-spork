@@ -43,5 +43,9 @@ export interface PluginHost extends Plugin {
   rebuildRelatedNotes(): Promise<void>;
   backfillVideos(): Promise<void>;
   backfillVisionOcr(): Promise<void>;
+  /** 批次二维护命令（2026-10-16）：未分类笔记补跑 AI 分类 / folder 字段错位修复 / 全量补录执行器。 */
+  recategorizeUncategorized(): Promise<void>;
+  fixFolderMismatch(): Promise<void>;
+  backfillAll(): Promise<void>;
   showResult(msg: string, isError?: boolean): void;
 }

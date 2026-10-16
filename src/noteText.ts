@@ -1,6 +1,7 @@
 // noteText.ts — 笔记文本手术的纯函数层（M3 SummaryService 的「原文零覆盖」保障）。
 // 不依赖 obsidian，可在 Node 中独立单元验证（见 tests/）。
 import type { SummaryRecord } from "./types/state";
+import { sliceByCodePoints } from "./util";
 
 // ---------- 笔记文本手术（M3 SummaryService 的「原文零覆盖」保障） ----------
 
@@ -152,8 +153,32 @@ function calloutLine(s: string): string {
 }
 
 /**
+ * 一行式短摘要哨兵拆分（批次二 v4，2026-10-16，纯函数可测）：
+ * 模型按提示词约定在全文首行输出 `一行式：<60 字内单行结论>`，其后空行接全文摘要。
+ * 首行命中 `^一行式：` 前缀即拆出 oneLiner，剩余为 body；无哨兵（v3 存量回填 / 模型漏输出）
+ * 回退：oneLiner = 全文首个非空行按码点截 60 字（sliceByCodePoints，emoji 不劈代理对），body = 全文。
+ */
+export function splitOneLiner(raw: string): { oneLiner: string; body: string } {
+  const text = String(raw ?? "").replace(/\r\n/g, "\n");
+  const lines = text.split("\n");
+  const firstIdx = lines.findIndex((l) => l.trim() !== "");
+  if (firstIdx >= 0) {
+    const m = lines[firstIdx].match(/^一行式：\s*(.*)$/);
+    if (m) {
+      return { oneLiner: m[1].trim(), body: lines.slice(firstIdx + 1).join("\n").trim() };
+    }
+  }
+  // 无哨兵回退：首个非空行前 60 码点；body 仍是全文（分层语义 fm=短、块=全文 不变）
+  const firstLine = firstIdx >= 0 ? lines[firstIdx].trim() : "";
+  return { oneLiner: sliceByCodePoints(firstLine, 60), body: text.trim() };
+}
+
+/**
  * 原子摘要写入的纯函数部分：一次字符串变换内同时完成
  * ① frontmatter summary / summary_v 的 upsert；② 正文摘要折叠块的 upsert。
+ * 分层写入（批次二 v4，2026-10-16 拍板）：fm summary 写一行短摘要、正文摘要块写全文摘要——
+ * 此前两者写同一份全文是 584 篇存量笔记「双份冗余」的源头。拆分经 splitOneLiner：
+ * 有哨兵按哨兵拆，无哨兵（含旧三参调用传入的 v3 全文摘要）回退为首行前 60 字，语义仍成立。
  * 配合 app.vault.process 使用（Obsidian 的原子读-改-写原语）——
  * 旧的「processFrontMatter 全量写 → 再 read → 再 modify」三遍全文件 IO，两次写之间
  * 用户或并发回填的改动会被陈旧快照整体覆盖；合并后此类竞态窗口消失。
@@ -163,6 +188,9 @@ export function applySummaryToNote(markdownRaw: string, summary: string, summary
   const markdown = stripBom(markdownRaw);
   // 畸形 frontmatter（--- 无闭合）：任何写入都会让原围栏降级为正文，放弃并保持原样（宁可不动）
   if (isUnclosedFrontmatter(markdown)) return markdown;
+  const { oneLiner, body } = splitOneLiner(summary);
+  // 模型只输出了一行式（body 空）时块保底不空：块=全文=该行，分层语义不破
+  const blockText = body || oneLiner;
   const fmEntries = (v: string, ver?: number): string[] => {
     const out = [`summary: ${JSON.stringify(v)}`];
     if (ver !== undefined && Number.isFinite(ver) && ver > 0) out.push(`summary_v: ${Math.floor(ver)}`);
@@ -188,16 +216,16 @@ export function applySummaryToNote(markdownRaw: string, summary: string, summary
         // 旧行保留 + 新行追加 = 每次手动摘要多一行重复 YAML 键，无上限增长
         const keys = ver !== undefined && Number.isFinite(ver) && ver > 0 ? ["summary", "summary_v"] : ["summary"];
         const kept = removeFmEntries(lines.slice(1, i), keys);
-        withFm = ["---", ...kept, ...fmEntries(summary, ver), ...lines.slice(i)].join("\n");
+        withFm = ["---", ...kept, ...fmEntries(oneLiner, ver), ...lines.slice(i)].join("\n");
         break;
       }
     }
   } else {
     // 无 frontmatter：新建一块（正文原样保留）
-    withFm = ["---", ...fmEntries(summary, summaryV), "---", "", ...markdown.split(/\r?\n/)].join("\n");
+    withFm = ["---", ...fmEntries(oneLiner, summaryV), "---", "", ...markdown.split(/\r?\n/)].join("\n");
   }
-  // ② 正文摘要折叠块：插入或原位替换（与 frontmatter 同一次字符串变换内完成）
-  return upsertAbstractBlock(withFm, summary);
+  // ② 正文摘要折叠块：插入或原位替换（与 frontmatter 同一次字符串变换内完成）；块写全文摘要
+  return upsertAbstractBlock(withFm, blockText);
 }
 
 /**

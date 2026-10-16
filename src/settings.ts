@@ -290,7 +290,9 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
         .setName("补跑旧视频笔记")
         .setDesc("对已同步但缺转录/缺摘要/关键帧数少于当前设置的旧视频批量补跑（已有转录直接复用不重复计费；数量上限同「每次同步最多转写条数」）；每次同步结束也会自动补一轮缺口")
         .addButton((b) => b.setButtonText("开始补跑").onClick(() => void this.plugin.backfillVideos()))
-        .addButton((b) => b.setButtonText("补录图文 OCR").onClick(() => void this.plugin.backfillVisionOcr()));
+        .addButton((b) => b.setButtonText("补录图文 OCR").onClick(() => void this.plugin.backfillVisionOcr()))
+        // 批次二 G（2026-10-16）：循环执行两链直至无缺口的执行器——存量缺口几百条量级时的小时级长任务
+        .addButton((b) => b.setButtonText("全量补录").onClick(() => void this.plugin.backfillAll()));
     }
 
     new Setting(containerEl).setName("语音转写").setHeading();
@@ -369,6 +371,12 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
         t.inputEl.rows = 5;
         t.inputEl.style.width = "100%";
       });
+    // 批次二维护按钮（2026-10-16）：历史未分类笔记补跑 AI 分类 / folder 字段错位修复（风格对齐「补录图文 OCR」）
+    new Setting(containerEl)
+      .setName("分类与目录维护")
+      .setDesc("「补跑未分类」：对 frontmatter category 为空的存量笔记补跑 AI 分类并移动到分类目录（每轮上限 50 条）；「修复 folder 错位」：以笔记实际所在目录为准统一修正 folder 字段与来源行（只改元数据，不移动文件）。也可用同名命令面板命令")
+      .addButton((b) => b.setButtonText("补跑未分类").onClick(() => void this.plugin.recategorizeUncategorized()))
+      .addButton((b) => b.setButtonText("修复 folder 错位").onClick(() => void this.plugin.fixFolderMismatch()));
     new Setting(containerEl).setName("启用图片文字识别").setDesc("图文笔记逐张交给视觉模型，写入「图片文字」折叠块").addToggle((t) => t.setValue(s.enableVision).onChange(async (v) => { s.enableVision = v; this.queueSave(); }));
     new Setting(containerEl).setName("视觉模型").addText((t) => t.setValue(s.visionModel).onChange(async (v) => { s.visionModel = v.trim() || "qwen-vl-plus"; this.queueSave(); }));
     new Setting(containerEl)

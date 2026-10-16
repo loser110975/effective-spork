@@ -165,7 +165,10 @@ export const DEFAULT_SETTINGS: DouyinSyncSettings = {
   aiBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
   aiKey: "",
   aiModel: "qwen-plus",
-  aiCategories: "成长学习\n投资理财\nAI编程\n心理情感\n职场商业\n娱乐生活\n运动健康",
+  // 批次二（2026-10-16 拍板）追加 4 词：副业/自媒体/两性/AI 实战。仅改默认值，
+  // 不做存量迁移——settings.json 里已有的 aiCategories 不会被本改动自动更新（数据跑批由主理人负责）。
+  aiCategories:
+    "成长学习\n投资理财\nAI编程\n心理情感\n职场商业\n娱乐生活\n运动健康\n副业搞钱\n自媒体创作\n两性恋爱\nAI 实战应用",
   enableCategory: true,
   enableVision: true,
   visionModel: "qwen-vl-plus",

@@ -63,9 +63,16 @@ export async function generateSummaryForFile(app: App, file: TFile, s: DouyinSyn
   // 第十四轮：首尾保留式截断（首 6000 + 尾 2000），截断时明示中段缺失、严禁编造——
   // 原头部截断静默丢尾部且模型不知道原文不完整
   const sliced = headTailSlice(source, SOURCE_HEAD_CHARS, SOURCE_TAIL_CHARS);
+  // 提示词 v4 改造（批次二，2026-10-16 拍板；与视频通道 buildPrompt 的硬要求同口径）：
+  // ① 首行「一行式：」哨兵（applySummaryToNote 据此把 fm summary 拆成短摘要）；② 禁叠层；
+  // ③ 禁时间线复述；④ 全文 ≤600 字。要点条数骨架保留。
   const prompt =
-    "你是笔记摘要助手。请把下面的抖音视频逐字稿与图片文字压缩成一份中文摘要，" +
-    `输出 3~6 条要点，每条一行、以「- 」开头，不要任何开场白与总结语。` +
+    "你是笔记摘要助手。请把下面的抖音视频逐字稿与图片文字压缩成一份中文摘要。" +
+    "输出要求：全文第一行固定为「一行式：<60 字以内的单行结论>」，其后空一行，" +
+    "再输出 3~6 条要点，每条一行、以「- 」开头；" +
+    "只提炼可复用的结论、方法与数据，丢掉寒暄、过渡与口播重复，禁止按原文时间线逐段复述；" +
+    "全文只保留一个总结层，不要输出两段同义收尾；正文（不含一行式行）不超过 600 字。" +
+    `不要任何开场白与免责声明。` +
     (sliced.truncated ? SOURCE_TRUNCATION_NOTICE : "") +
     `\n\n${sliced.text}`;
 

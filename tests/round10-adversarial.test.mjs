@@ -374,7 +374,8 @@ export function runTests(m) {
       t("400 图片超限 → 降档 2 张重试（B1 旧判定在此 break，摘要永久失败）", seenImageCounts[1] === 2);
       t("降档后成功且 framesUsed=2（可反推降档发生）", r.ok === true && r.record?.framesUsed === 2);
       const content = vault.files.get(notePath).data;
-      t("summary_v: 3 与 summary_style 落盘", /^summary_v: 3$/m.test(content) && content.includes('summary_style: "hierarchy"'));
+      // 批次二 v4：SUMMARY_V 3 → 4，写盘版本号随常量同步升级
+      t("summary_v: 4 与 summary_style 落盘", /^summary_v: 4$/m.test(content) && content.includes('summary_style: "hierarchy"'));
       t("摘要块写入且版本门生效", content.includes("> [!abstract]- 摘要") && content.includes("测试摘要"));
     }
 

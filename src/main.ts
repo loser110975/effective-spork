@@ -137,6 +137,22 @@ export default class DouyinSyncPlugin extends Plugin {
       name: "补录图文笔记的图片文字",
       callback: () => void this.backfillVisionOcr(),
     });
+    // 批次二维护命令（2026-10-16）：未分类补跑 AI 分类 / folder 字段错位修复 / 全量补录执行器
+    this.addCommand({
+      id: "recategorize-uncategorized",
+      name: "为未分类笔记补跑 AI 分类",
+      callback: () => void this.recategorizeUncategorized(),
+    });
+    this.addCommand({
+      id: "fix-folder-mismatch",
+      name: "修复 folder 字段错位",
+      callback: () => void this.fixFolderMismatch(),
+    });
+    this.addCommand({
+      id: "backfill-all",
+      name: "全量补录存量缺口（OCR+摘要）",
+      callback: () => void this.backfillAll(),
+    });
     // 强制重抽帧（keyframeIntervalSec 不追溯的逃生门）：一次性标志，下次同步生效后自动清除
     this.addCommand({
       id: "force-frame-resync",
@@ -555,6 +571,55 @@ export default class DouyinSyncPlugin extends Plugin {
       new Notice(msg || "图文 OCR 补录：无缺口（全部健康或未启用 OCR）", 10000);
     } catch (e: any) {
       new Notice(`图文 OCR 补录失败：${String(e?.message ?? e)}`, 8000);
+    }
+  }
+
+  /** 未分类笔记补跑 AI 分类（批次二 C，2026-10-16）：AI 重分类 → fm 回填 + 移动到分类目录。 */
+  async recategorizeUncategorized(): Promise<void> {
+    if (this.engine.running) {
+      new Notice("抖音同步正在进行中，请稍后再试");
+      return;
+    }
+    new Notice("分类补跑：开始…", 0);
+    try {
+      const msg = await this.engine.recategorizeUncategorized((t) => this.setStatusBar(t));
+      new Notice(msg, 10000);
+    } catch (e: any) {
+      new Notice(`分类补跑失败：${String(e?.message ?? e)}`, 8000);
+    }
+  }
+
+  /** folder 字段错位修复（批次二 D，2026-10-16）：以笔记实际目录为准统一修正 fm folder / 来源行 / 台账。 */
+  async fixFolderMismatch(): Promise<void> {
+    if (this.engine.running) {
+      new Notice("抖音同步正在进行中，请稍后再试");
+      return;
+    }
+    new Notice("folder 错位修复：开始…", 0);
+    try {
+      const msg = await this.engine.fixFolderMismatch((t) => this.setStatusBar(t));
+      new Notice(msg, 10000);
+    } catch (e: any) {
+      new Notice(`folder 错位修复失败：${String(e?.message ?? e)}`, 8000);
+    }
+  }
+
+  /**
+   * 全量补录存量缺口（批次二 G，2026-10-16）：循环执行「图文 OCR 补录 + 视频摘要补跑」
+   * 直至无缺口。存量缺口为几百条量级时是小时级长任务——开始 Notice 明示耗时预期，
+   * 进度经状态栏滚动更新，完成后弹总汇报。
+   */
+  async backfillAll(): Promise<void> {
+    if (this.engine.running) {
+      new Notice("抖音同步正在进行中，请稍后再试");
+      return;
+    }
+    new Notice("全量补录：开始（存量缺口较大时预计十小时级，期间请保持 Obsidian 运行、不要同步其他内容）…", 0);
+    try {
+      const msg = await this.engine.backfillAll((t) => this.setStatusBar(t));
+      new Notice(msg, 15000);
+    } catch (e: any) {
+      new Notice(`全量补录失败：${String(e?.message ?? e)}`, 8000);
     }
   }
 

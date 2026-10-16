@@ -77,7 +77,9 @@ export function runTests(m) {
     t("未截断（缺省参数）不含截断明示", !p2.includes("中段省略") && !p2.includes("严禁对未提供的中间内容"));
     const p3 = m.buildPrompt({ ...base, transcriptTruncated: false });
     t("truncated=false 不含截断明示", !p3.includes("中段省略"));
-    t("不传新参数时既有结构兼容（转录原文与风格段仍在）", p2.includes("转录内容") && p2.includes("## AI 总结"));
+    // 批次二 v4（2026-10-16 拍板禁叠层）：「AI 总结」独立收尾节被移除，收尾只保留唯一的
+    //「总结与意义」节——原断言（p2 含 ## AI 总结）随 v4 提示词改造同步更新
+    t("不传新参数时既有结构兼容（转录原文与风格段仍在）", p2.includes("转录内容") && p2.includes("## 总结与意义") && !p2.includes("## AI 总结"));
     // 空转录走「无转录」分支：即使误传 truncated=true 也不出现明示句（分支互斥）
     const p4 = m.buildPrompt({ ...base, transcript: "  ", transcriptTruncated: true });
     t("空转录分支不出现截断明示", p4.includes("空或无效") && !p4.includes("中段省略"));

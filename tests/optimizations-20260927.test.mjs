@@ -32,11 +32,13 @@ export function runTests(m) {
   const out1 = applySummaryToNote(base, "新摘要\n第二行", 3);
   const fm1 = out1.slice(0, out1.indexOf("\n---\n") + 1) + "---";
   t("旧 summary 与 summary_v 被移除", !out1.includes("旧摘要") && !/^summary_v: 2$/m.test(fm1));
-  t("新 summary 以 JSON 双引号标量写入（含换行转义）", out1.includes(`summary: ${JSON.stringify("新摘要\n第二行")}`));
+  // 批次二 v4 分层（2026-10-16）：fm summary 写一行短摘要（无哨兵回退 = 首行前 60 码点）、
+  // 正文摘要块写全文摘要——fm 不再携带多行全文
+  t("新 summary 分层：fm 写短摘要（JSON 双引号标量）", out1.includes(`summary: ${JSON.stringify("新摘要")}`));
   t("summary_v 更新为 3", /^summary_v: 3$/m.test(out1));
   t("其余 frontmatter 键保留", /^type: "视频"$/m.test(fm1) && /^transcript_status: success$/m.test(fm1));
   t("正文逐字稿折叠块逐字保留", out1.includes("> [!quote]- 逐字稿\n> 内容"));
-  t("摘要折叠块已写入", out1.includes("> [!abstract]- 摘要") && out1.includes("> 新摘要"));
+  t("摘要折叠块写入全文摘要", out1.includes("> [!abstract]- 摘要") && out1.includes("> 新摘要") && out1.includes("> 第二行"));
 
   const multi = ["---", "title: t", "summary: >-", "  旧第一行", "  旧第二行", "type: 视频", "---", "正文"].join("\n");
   const out2 = applySummaryToNote(multi, "新");
