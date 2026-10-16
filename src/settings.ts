@@ -288,8 +288,9 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
         .addText((t) => { t.setValue(String(s.keyframeIntervalSec)).onChange(async (v) => { const n = parseInt(v, 10); s.keyframeIntervalSec = Number.isFinite(n) ? Math.max(1, Math.min(60, n)) : 10; this.queueSave(); }); });
       new Setting(containerEl)
         .setName("补跑旧视频笔记")
-        .setDesc("对已同步但缺转录/缺摘要/关键帧数少于当前设置的旧视频批量补跑（已有转录直接复用不重复计费；数量上限同「每次同步最多转写条数」）")
-        .addButton((b) => b.setButtonText("开始补跑").onClick(() => void this.plugin.backfillVideos()));
+        .setDesc("对已同步但缺转录/缺摘要/关键帧数少于当前设置的旧视频批量补跑（已有转录直接复用不重复计费；数量上限同「每次同步最多转写条数」）；每次同步结束也会自动补一轮缺口")
+        .addButton((b) => b.setButtonText("开始补跑").onClick(() => void this.plugin.backfillVideos()))
+        .addButton((b) => b.setButtonText("补录图文 OCR").onClick(() => void this.plugin.backfillVisionOcr()));
     }
 
     new Setting(containerEl).setName("语音转写").setHeading();

@@ -338,7 +338,7 @@ export function runTests(m) {
     }
 
     // =====================================================================
-    console.log("— 视频摘要降档端到端：图片数超限 → 5 档重试 → 成功落盘（B1 集成，纯函数外的消费链）—");
+    console.log("— 视频摘要降档端到端：图片数超限 → 降档重试 → 成功落盘（B1 集成，纯函数外的消费链；2026-10-16 帧减量后首档 3）—");
     {
       const vault = new MiniVault(TFile, TFolder);
       const framePaths = Array.from({ length: 6 }, (_, i) => `抖音/Media/frames/b1000001/frame_0${i + 1}.jpg`);
@@ -360,7 +360,7 @@ export function runTests(m) {
         const body = JSON.parse(p.body);
         seenImageCounts.push(body.messages[0].content.filter((c) => c.type === "image_url").length);
         if (call === 1) {
-          // 6 帧 × 上限 5 张的模型：首档 8 命中图片数超限（不得包含 max_tokens 字样，避开钳制分支）
+          // 6 帧 × 上限 2 张的模型：首档 3 命中图片数超限（不得包含 max_tokens 字样，避开钳制分支）
           return { status: 400, text: '{"error":{"message":"input image count exceeds the model limit"}}' };
         }
         const payload = { choices: [{ message: { content: "主题:测试主题\n\n## 引言\n核心问题：测试。\n\n## AI 总结\n测试摘要。" }, finish_reason: "stop" }] };
@@ -370,9 +370,9 @@ export function runTests(m) {
         title: "测试视频", desc: "", transcript: "口播内容", framePaths,
       });
       noNet();
-      t("首档 8 帧请求实际送出 6 张（短视频不足首档）", seenImageCounts[0] === 6);
-      t("400 图片超限 → 降档 5 张重试（B1 旧判定在此 break，摘要永久失败）", seenImageCounts[1] === 5);
-      t("降档后成功且 framesUsed=5（可反推降档发生）", r.ok === true && r.record?.framesUsed === 5);
+      t("首档 3 帧请求实际送出 3 张（6 帧均匀抽样）", seenImageCounts[0] === 3);
+      t("400 图片超限 → 降档 2 张重试（B1 旧判定在此 break，摘要永久失败）", seenImageCounts[1] === 2);
+      t("降档后成功且 framesUsed=2（可反推降档发生）", r.ok === true && r.record?.framesUsed === 2);
       const content = vault.files.get(notePath).data;
       t("summary_v: 3 与 summary_style 落盘", /^summary_v: 3$/m.test(content) && content.includes('summary_style: "hierarchy"'));
       t("摘要块写入且版本门生效", content.includes("> [!abstract]- 摘要") && content.includes("测试摘要"));

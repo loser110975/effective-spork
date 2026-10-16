@@ -131,6 +131,12 @@ export default class DouyinSyncPlugin extends Plugin {
       name: "补跑旧视频笔记（转录+抽帧+摘要）",
       callback: () => void this.backfillVideos(),
     });
+    // 图文 OCR 补录（2026-10-16）：同步收尾也会自动跑一轮，此命令是手动全量入口
+    this.addCommand({
+      id: "vision-backfill",
+      name: "补录图文笔记的图片文字",
+      callback: () => void this.backfillVisionOcr(),
+    });
     // 强制重抽帧（keyframeIntervalSec 不追溯的逃生门）：一次性标志，下次同步生效后自动清除
     this.addCommand({
       id: "force-frame-resync",
@@ -193,7 +199,8 @@ export default class DouyinSyncPlugin extends Plugin {
     // 临时素材根目录清理（P3-2）：onload 即清上次会话崩溃残留，不等首次视频拉取
     this.engine.cleanupTempRoot();
 
-    // 可选：启动时自动拉起桥接（默认关闭；用户已明确不要开机自启类行为）
+    // 启动时自动拉起桥接（processAutoStart 默认开启，2026-10-16 拍板）：
+    // ≠系统开机自启——只在 Obsidian 运行期拉起，退出仍随插件 dispose 回收，登录态失效仍需人工扫码
     if (this.settings.processAutoStart && this.settings.bridgeEnabled) {
       this.startupTimers.push(window.setTimeout(() => void this.processManager.start(), 3_000));
     }
@@ -335,6 +342,24 @@ export default class DouyinSyncPlugin extends Plugin {
     const summary: SyncSummary = await this.engine.syncAll();
     if (summary.asrFailed > 0) {
       new Notice(`有 ${summary.asrFailed} 条转写失败，已加入重试队列（下次同步自动续传）`, 8000);
+    }
+    // 自动失败重试（2026-10-16 拍板「失败处置烦」）：同步收尾自动补两类缺口，不等人工捞——
+    // ① 图文 OCR 缺口（上限 30 条/轮，成功段不重打零重复计费）
+    // ② 摘要缺口（补跑通道 zeroAsrBudget 模式：只重出「已有转录」的摘要，零转写计费，上限 50）
+    // 两者都受 backfillFails 连续失败保护（≥3 跳过），无缺口时引擎返回空串 → 不弹 Notice。
+    try {
+      const msgs: string[] = [];
+      const ocrMsg = await this.engine.backfillVision((t) => this.setStatusBar(t));
+      if (ocrMsg) msgs.push(ocrMsg);
+      const sumMsg = await this.engine.backfillVideos((t) => this.setStatusBar(t), { zeroAsrBudget: true });
+      if (sumMsg) msgs.push(sumMsg);
+      if (msgs.length) new Notice(msgs.join("\n"), 10000);
+    } catch (e: any) {
+      // 补缺口失败不吞同步结果：只提示，不重抛
+      new Notice(`自动补缺口失败：${String(e?.message ?? e)}`, 8000);
+    } finally {
+      // 自动链复用了状态栏展示进度，收尾恢复成常规「上次同步」口径
+      this.setStatusBar(`上次同步 ${new Date().toLocaleTimeString("zh-CN")}`);
     }
     // 强制重抽帧（一次性标志）：常规同步只覆盖新增条目，已存视频的强制重抽由补跑通道执行。
     // 标志在补跑轮收尾自动清除；补跑失败（抛错）时标志保留，下次同步继续。
@@ -515,6 +540,21 @@ export default class DouyinSyncPlugin extends Plugin {
       new Notice(msg, 10000);
     } catch (e: any) {
       new Notice(`补跑失败：${String(e?.message ?? e)}`, 8000);
+    }
+  }
+
+  /** 图文 OCR 补录（2026-10-16）：历史无块 / 识别失败段批量重识别并原位回写。 */
+  async backfillVisionOcr(): Promise<void> {
+    if (this.engine.running) {
+      new Notice("抖音同步正在进行中，请稍后再试");
+      return;
+    }
+    new Notice("图文 OCR 补录：开始…", 0);
+    try {
+      const msg = await this.engine.backfillVision((t) => this.setStatusBar(t));
+      new Notice(msg || "图文 OCR 补录：无缺口（全部健康或未启用 OCR）", 10000);
+    } catch (e: any) {
+      new Notice(`图文 OCR 补录失败：${String(e?.message ?? e)}`, 8000);
     }
   }
 

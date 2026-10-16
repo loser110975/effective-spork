@@ -42,5 +42,6 @@ export interface PluginHost extends Plugin {
   summarizeActive(): Promise<void>;
   rebuildRelatedNotes(): Promise<void>;
   backfillVideos(): Promise<void>;
+  backfillVisionOcr(): Promise<void>;
   showResult(msg: string, isError?: boolean): void;
 }

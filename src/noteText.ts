@@ -307,6 +307,82 @@ export function appendOcrToNoteCallout(markdownRaw: string, text: string): strin
 }
 
 /**
+ * 图片文字补录回写（2026-10-16 OCR 补录链，纯函数可测）：按图序号把新识别结果原位
+ * 替换进「图片文字」折叠块——只重写「识别失败 / 空文本 / 占位（无文字）」的段，
+ * 已有正文的段逐字保留，补录天然幂等（重复跑不重打成功图、不重复计费）。
+ * 段格式与 noteBuilder 产出、collectExistingAssets 回收口径逐字一致：
+ * `**图 N**（status）` 头 + 文本行（写入侧经 calloutLine 变换）。
+ * 块不存在时整块新建（插入位置与 appendOcrToNoteCallout 相同：frontmatter 之后）。
+ */
+export function upsertOcrRowsToCallout(
+  markdownRaw: string,
+  rows: { index: number; text: string; status: string }[],
+): string {
+  const markdown = stripBom(markdownRaw);
+  if (rows.length === 0) return markdown;
+  const byIndex = new Map(rows.map((r) => [r.index, r]));
+  const SEG_HEAD_RE = /^\*\*图 (\d+)\*\*（(.+?)）$/;
+  const isStale = (status: string, text: string): boolean =>
+    /识别失败/.test(status) || text.trim() === "" || text.trim() === "（无文字）";
+  const renderRow = (r: { index: number; text: string; status: string }): string[] => {
+    // status 压单行（错误信息可能多行，与 noteBuilder 113 行同款）
+    const status = String(r.status).replace(/\r?\n/g, " ");
+    const body = r.text && r.text.trim() ? r.text : "（无文字）";
+    // 段内空行必须带 callout 前缀（"> "）：裸空行会被 calloutRange 判为块结束，
+    // 后续分段全部脱离折叠块（round15 幂等用例抓到的回归）
+    return [`> **图 ${r.index}**（${status}）`, "> ", ...body.split(/\r?\n/).map(calloutLine), "> "];
+  };
+  const lines = markdown.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (!OCR_HEAD_RE.test(lines[i])) continue;
+    const end = calloutRange(lines, i);
+    const out: string[] = [lines[i]];
+    let j = i + 1;
+    while (j <= end) {
+      const seg = lines[j].replace(/^>\s?/, "");
+      const m = seg.match(SEG_HEAD_RE);
+      if (!m) {
+        out.push(lines[j]);
+        j++;
+        continue;
+      }
+      // 收集本段文本行（直到下一分段头；块内行前缀 `> ` 剥离后比对）
+      let k = j + 1;
+      const textLines: string[] = [];
+      while (k <= end) {
+        const b = lines[k].replace(/^>\s?/, "");
+        if (SEG_HEAD_RE.test(b)) break;
+        textLines.push(b);
+        k++;
+      }
+      const fresh = byIndex.get(Number(m[1]));
+      // 回收口径（collectExistingAssets）跳过空行与 `[!` 行，这里同款过滤后比对
+      const bodyText = textLines.filter((l) => l.trim() !== "" && !l.startsWith("[!")).join("\n");
+      if (fresh && isStale(m[2], bodyText)) out.push(...renderRow(fresh));
+      else out.push(...lines.slice(j, k));
+      j = k;
+    }
+    return [...lines.slice(0, i), ...out, ...lines.slice(end + 1)].join("\n");
+  }
+  // 块不存在 → 整块新建（畸形 frontmatter 保护与 appendOcrToNoteCallout 同款）
+  if (isUnclosedFrontmatter(markdown)) return markdown;
+  const block: string[] = [`> [!note]- 图片文字`, "> "];
+  for (const r of rows) block.push(...renderRow(r));
+  let insertAt = 0;
+  if (lines[0]?.trim() === "---") {
+    for (let i = 1; i < lines.length; i++) {
+      if (isFenceClose(lines[i])) {
+        insertAt = i + 1;
+        break;
+      }
+    }
+    if (insertAt === 0) return markdown;
+  }
+  while (insertAt < lines.length && lines[insertAt].trim() === "") insertAt++;
+  return [...lines.slice(0, insertAt), ...block, "", ...lines.slice(insertAt)].join("\n");
+}
+
+/**
  * 均匀抽样 n 个元素（保留首与末），用于把关键帧压进模型允许的图片数上限。
  * 各通道图片数上限差异极大（实测智谱 glm-4v-flash 仅 5 张），故需按上限自适应降档。
  */

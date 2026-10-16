@@ -109,7 +109,7 @@ export interface DouyinSyncSettings {
   // ---------- 四项新功能（M1 进程管控 / M2 图片 OCR / M3 AI 摘要 / M4 二维状态） ----------
   /** 桥接进程管控面板与启停重启（F1） */
   bridgeProcessEnabled: boolean;
-  /** Obsidian 启动时自动拉起桥接（F1，默认关闭：用户已明确不要开机自启类行为） */
+  /** Obsidian 启动时自动拉起桥接（F1，默认开启；2026-10-16 拍板。≠系统开机自启——只在 Obsidian 运行期拉起，登录态失效仍需人工扫码） */
   processAutoStart: boolean;
   /** 二维状态刷新间隔（F4，≤ 5000ms） */
   processRefreshMs: number;
@@ -183,7 +183,7 @@ export const DEFAULT_SETTINGS: DouyinSyncSettings = {
   bridgeNodeModules: "",
   // 四项新功能默认值（见 系统设计 §4.2.1）
   bridgeProcessEnabled: true,
-  processAutoStart: false,
+  processAutoStart: true,
   processRefreshMs: 5000,
   ocrPanelEnabled: true,
   ocrBaseUrl: "https://api.agnes-ai.cn/v1",

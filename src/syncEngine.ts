@@ -8,7 +8,7 @@ import { VideoMediaStore, VideoAssets, isDeterministicMediaError, type MediaErro
 import { generateBases } from "./bases";
 import { buildNote, planNotePath } from "./noteBuilder";
 import { generateAndWriteVideoSummary, listVideoFramePaths, SUMMARY_V } from "./videoSummaryService";
-import { extractSummarySources, collectExistingAssets, applySummaryToNote, frontmatterBlock, pushSummaryRecord, type ReusedNoteAssets } from "./statusCore";
+import { extractSummarySources, collectExistingAssets, applySummaryToNote, frontmatterBlock, pushSummaryRecord, upsertOcrRowsToCallout, type ReusedNoteAssets } from "./statusCore";
 import { applyRelatedToNote, buildRelatedBlock, pickRelatedLinks, type RelatedCandidate, type RelatedLink } from "./relatedNotes";
 import type { DouyinSyncSettings } from "./types/settings";
 import type { SyncState } from "./types/state";
@@ -133,6 +133,8 @@ export class SyncEngine {
   private media: MediaStore;
   private videoMedia: VideoMediaStore;
   private ai: AiClient | null = null;
+  /** 同步进行中的常驻进度 Notice（任务 4 条目级进度）：syncAll 持有，processItem 完成时原位更新文本 */
+  private syncNotice: Notice | null = null;
   /** OCR 专用视觉通道：配了独立基址/Key 时与分类通道分离（实测硅基流动视觉模型会 503 过载） */
   private visionAi: AiClient | null = null;
   /** OCR 全局并发闸门：跨条目统一限流，避免条目级 × 图片级并发把请求放大 9 倍（见 visionConcurrency 说明） */
@@ -452,6 +454,7 @@ export class SyncEngine {
     const summary = newSyncSummary();
     summary.startedAt = nowIso();
     const notice = new Notice("抖音同步：开始…", 0);
+    this.syncNotice = notice;
     try {
       // 设置可能在本会话内被改过（Obsidian 改设置不会重载插件）→ 按最新设置重建 AI 客户端，
       // 否则「在设置页换了 OCR 通道/模型」不会生效（实测踩坑：换了通道仍打旧服务端并持续 503）。
@@ -579,6 +582,7 @@ export class SyncEngine {
       await this.saveState().catch(() => {});
       return summary;
     } finally {
+      this.syncNotice = null;
       this.running = false;
     }
   }
@@ -860,14 +864,24 @@ export class SyncEngine {
       this.recordStageTimings(item, perf.perf, perf.totalMs());
       this.markStateDirty(); // 节流落盘（原 await saveState()：每条全量写 689KB）
       summary.created++;
+      this.updateSyncProgress(summary);
       return true;
     } catch (e: any) {
       summary.errors.push(`[${item.id}] ${String(e?.message ?? e).slice(0, 100)}`);
       // 失败也要触发落盘（第九轮 B3）：转写暂存写在 state 里，不落盘的话崩溃窗口内暂存丢失，
       // 下轮仍会重新计费
       this.markStateDirty();
+      this.updateSyncProgress(summary);
       return false;
     }
+  }
+
+  /** 条目级进度更新（任务 4）：常驻 Notice 原位改写累计计数。条目级并发下完成频率低（秒级间隔），无闪烁问题。 */
+  private updateSyncProgress(summary: SyncSummary): void {
+    this.syncNotice?.setMessage(
+      `抖音同步：已入库 ${summary.created}｜跳过 ${summary.skipped}｜转写失败 ${summary.asrFailed}` +
+        (summary.errors.length ? `｜错误 ${summary.errors.length}` : ""),
+    );
   }
 
   /** 阶段 1：资产回收（重试路径与「全新撞库」路径共用）。回收失败回退 null（调用方走原联网路径）。 */
@@ -1696,7 +1710,7 @@ export class SyncEngine {
    * 关键帧数少于当前设置（补帧）。已有成功转录的直接复用，不重复调用 ASR。
    * 预算复用 maxTranscribePerSync。
    */
-  async backfillVideos(onProgress?: (text: string) => void): Promise<string> {
+  async backfillVideos(onProgress?: (text: string) => void, opts?: { zeroAsrBudget?: boolean }): Promise<string> {
     if (this.running) throw new Error("同步正在进行中");
     this.running = true;
     const summary = newSyncSummary();
@@ -1708,7 +1722,9 @@ export class SyncEngine {
       // 转写预算语义与同步路径对齐（第九轮 A11）：0 = 不再转写（原 Math.max(1,…) 会让
       // 「用户设 0 禁用转写」的意图在补跑里照样白转 1 条）。预算 0 时只补「可复用已有转录」
       // 的候选（摘要/帧工作，零 ASR 计费），上限 50 条防一次点击跑完全库。
-      const budget = Math.max(0, this.settings.maxTranscribePerSync);
+      // zeroAsrBudget（2026-10-16 自动重试链）：同步收尾自动补摘要缺口时强制走预算 0 语义
+      // ——只重出「已有转录」的摘要，零转写计费；处理 0 且失败 0 时返回空串（不弹 Notice）。
+      const budget = opts?.zeroAsrBudget ? 0 : Math.max(0, this.settings.maxTranscribePerSync);
       const REUSE_ONLY_CAP = 50;
     // 强制重抽一次性标志（keyframeIntervalSec 不追溯的逃生门）：本轮候选筛选忽略已存间隔，
     // 全部视频强制重抽；本轮完成后自动清除（异常中断不清，留给下轮继续）。
@@ -1860,10 +1876,138 @@ export class SyncEngine {
       this.state.forceFrameResync = false;
     }
     await this.saveState();
+    // zeroAsrBudget 自动链静默语义：本轮没有任何实际工作（全健康/无候选）→ 空串不弹 Notice
+    if (opts?.zeroAsrBudget && done === 0 && failed === 0) return "";
     const parts = [`补跑完成：处理 ${done}，跳过 ${skipped}，失败 ${failed}`];
     if (forceResync) parts.push(`强制重抽 ${summary.forcedFrameResync} 条`);
     if (summary.errors.length) parts.push(`注意：${summary.errors[0]}`);
     return parts.join("。");
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /**
+   * 图文 OCR 补录（2026-10-16 批次一/批次二共用基建）：
+   * 扫描已落账的图文笔记，找出「无图片文字块」（历史遗留，首次同步无 Key 的 168 条 +）
+   * 或「块内含识别失败 / 空文本段」的条目，重新识别后按图序号原位回写
+   * （upsertOcrRowsToCallout：成功段不重打 → 零重复计费）。
+   * 候选上限 VISION_BACKFILL_CAP 条/轮；失败计数复用 backfillFails（连续 ≥3 跳过，防死循环）。
+   * 消费方：同步收尾自动补录（main.runSync）、命令/面板「补录图文 OCR」、批次二全量存量补录。
+   * 返回给用户看的一句话；空串 = 无事发生（未启用 / 未配置 / 无缺口），调用方静默。
+   */
+  async backfillVision(onProgress?: (text: string) => void): Promise<string> {
+    if (this.running) throw new Error("同步正在进行中");
+    if (!this.settings.enableVision) return "";
+    this.running = true;
+    try {
+      this.refreshClients();
+      const ai = this.visionAi || this.ai;
+      if (!ai) return ""; // OCR 通道未配置（视觉 Base URL / Key）
+      const gate = this.ocrGate;
+      const CAP = 30;
+      let processed = 0; // 已发起详情请求的条数（含成功/失败）
+      let done = 0;
+      let failed = 0;
+      let healthy = 0;
+      const errors: string[] = [];
+      const bumpFail = (id: string) => {
+        this.state.backfillFails ??= {};
+        this.state.backfillFails[id] = (this.state.backfillFails[id] ?? 0) + 1;
+      };
+      for (const [id, entry] of Object.entries(this.state.processed)) {
+        if (processed >= CAP) break;
+        // 连续失败 ≥3 的条目本轮跳过（与 backfillVideos 同款防死循环，成功即清除）
+        if ((this.state.backfillFails?.[id] ?? 0) >= 3) continue;
+        const currentPath = this.findNotePath(id) ?? entry?.path;
+        if (!currentPath) continue;
+        const file = this.app.vault.getAbstractFileByPath(normalizePath(currentPath));
+        if (!(file instanceof TFile)) continue;
+        let content: string;
+        try {
+          content = await this.app.vault.read(file);
+        } catch {
+          continue;
+        }
+        // 只补图文类（typeLabel 与 noteBuilder 一致：note →「图文」）
+        const fm = frontmatterBlock(content);
+        if (!/^type:\s*"?(图文)"?\s*$/m.test(fm)) continue;
+        // 缺口判定：无图片文字块（历史遗留）或存在失败/空文本段
+        const reused = collectExistingAssets(content);
+        const needRows =
+          reused.visionTexts.length === 0
+            ? null // 无块：详情拉取后按全部图片序号识别
+            : reused.visionTexts.filter(
+                (r) => !r.text.trim() || r.text.trim() === "（无文字）" || /识别失败/.test(r.status),
+              );
+        if (reused.visionTexts.length > 0 && needRows!.length === 0) {
+          healthy++;
+          continue;
+        }
+        processed++;
+        onProgress?.(`补录图文 OCR：已处理 ${done + failed}/${CAP}`);
+        // 详情过串行闸门（与补跑同款口径：直连并发会绕开抖音 API 串行风控）
+        let item: SyncItem | null = null;
+        try {
+          const raw = await this.detailGate.run(() => this.client.getAwemeDetail(id));
+          item = raw ? DouyinClient.normalize(raw, entry.source ?? "collection") : null;
+        } catch (e: any) {
+          errors.push(`${id}：详情获取失败（${String(e?.message ?? e).slice(0, 60)}）`);
+          failed++;
+          bumpFail(id);
+          continue;
+        }
+        // 无详情 / 非图文 / 无图：无可补对象，跳过不记失败（避免把「作品无图」当故障反复重试）
+        if (!item || item.type !== "note" || item.imageUrls.length === 0) {
+          healthy++;
+          continue;
+        }
+        // 图片下载入库（downloadImages 内部已存在即跳过，零重复下载）→ OCR 输入优先本地字节
+        let localByIndex: Map<number, string>;
+        try {
+          localByIndex = (await this.downloadImages(item, null)).localImageByIndex;
+        } catch (e: any) {
+          errors.push(`${id}：图片下载失败（${String(e?.message ?? e).slice(0, 60)}）`);
+          failed++;
+          bumpFail(id);
+          continue;
+        }
+        // 只识别缺口图；needRows 里的 index 可能超出本次详情的图片范围（抖音侧改图/删图）→ 丢弃
+        const maxN = Math.min(item.imageUrls.length, this.settings.maxImages);
+        const targets = (
+          needRows ? needRows.map((r) => r.index - 1) : Array.from({ length: maxN }, (_, i) => i)
+        ).filter((i) => i >= 0 && i < maxN);
+        const rows = await mapLimit(targets, 2, async (i) => {
+          const url = item!.imageUrls[i];
+          try {
+            const localPath = localByIndex.get(i);
+            const dataUrl =
+              (localPath ? await this.media.dataUrlFromFile(localPath) : "") ||
+              (await this.media.toDataUrl(url)) ||
+              url;
+            const text = await (gate
+              ? gate.run(() => ai!.ocrImage(dataUrl, item!.title))
+              : ai!.ocrImage(dataUrl, item!.title));
+            return { index: i + 1, text, status: text ? "识别成功" : "未识别" };
+          } catch (e: any) {
+            return { index: i + 1, text: "", status: `识别失败：${String(e?.message ?? e).slice(0, 60)}` };
+          }
+        });
+        if (!rows.some((r) => r.text.trim() !== "")) {
+          errors.push(`${id}：本轮 0 张识别成功`);
+          failed++;
+          bumpFail(id);
+          continue;
+        }
+        await this.app.vault.process(file, (data) => upsertOcrRowsToCallout(data, rows));
+        done++;
+        if (this.state.backfillFails) delete this.state.backfillFails[id];
+      }
+      await this.saveState();
+      if (done === 0 && failed === 0) return ""; // 无缺口 / 全健康 → 静默
+      const parts = [`图文 OCR 补录：处理 ${done}，失败 ${failed}，健康 ${healthy}`];
+      if (errors.length) parts.push(`注意：${errors[0]}`);
+      return parts.join("。");
     } finally {
       this.running = false;
     }
