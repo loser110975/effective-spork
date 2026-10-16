@@ -251,9 +251,27 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
         .addText((t) => { t.setValue(String(s.relatedNotesMax)).onChange(async (v) => { const n = parseInt(v, 10); s.relatedNotesMax = Number.isFinite(n) ? Math.max(1, Math.min(30, n)) : 8; this.queueSave(); }); });
       new Setting(containerEl)
         .setName("重建全部相关笔记链接")
-        .setDesc("对全部已同步笔记重算互链块（无变化的笔记不写盘）；也可用命令「重建相关笔记链接」")
+        .setDesc("对全部已同步笔记重算互链块（无变化的笔记不写盘）；也可用命令「重建相关笔记链接」。已配置语义检索时，重建自动改用向量相似选链（内容真正相似才互链），未配置时维持同分类/同作者打分")
         .addButton((b) => b.setButtonText("开始重建").onClick(() => void this.plugin.rebuildRelatedNotes()));
     }
+
+    new Setting(containerEl).setName("语义检索（embedding）").setHeading();
+    new Setting(containerEl)
+      .setName("embedding Base URL")
+      .setDesc("OpenAI 兼容 /embeddings 端点；默认百炼 compatible-mode（text-embedding-v4 免费额度内够用）")
+      .addText((t) => t.setValue(s.embeddingBaseUrl).onChange(async (v) => { s.embeddingBaseUrl = v.trim() || "https://dashscope.aliyuncs.com/compatible-mode/v1"; this.queueSave(); }));
+    new Setting(containerEl)
+      .setName("embedding API Key")
+      .setDesc("与 AI 通道同账号（百炼）时填同一个 Key；留空 = 语义功能不可用（互链自动回落同分类/同作者打分）")
+      .addText((t) => { t.setValue(s.embeddingApiKey).onChange(async (v) => { s.embeddingApiKey = v.trim(); this.queueSave(); }); t.inputEl.type = "password"; });
+    new Setting(containerEl)
+      .setName("embedding 模型")
+      .setDesc("默认 text-embedding-v4（1024 维）；换模型会触发全库向量重算（索引内容不通用）")
+      .addText((t) => t.setValue(s.embeddingModel).onChange(async (v) => { s.embeddingModel = v.trim() || "text-embedding-v4"; this.queueSave(); }));
+    new Setting(containerEl)
+      .setName("构建语义索引")
+      .setDesc("把全库笔记正文向量化落盘（正文没变的篇目自动跳过、零重复计费；约 1100 篇首建分钟级）。建好后可用命令「语义搜索收藏」自然语言找内容；互链重建也自动升级为向量选链")
+      .addButton((b) => b.setButtonText("开始构建").onClick(() => void this.plugin.runSemanticIndex()));
 
     new Setting(containerEl).setName("视频多模态总结（视频类收藏专用）").setHeading();
     new Setting(containerEl)

@@ -14,6 +14,7 @@ import * as aiConfigMod from "../src/aiConfig";
 import * as videoSummaryServiceMod from "../src/videoSummaryService";
 import * as summaryServiceMod from "../src/summaryService";
 import * as relatedNotesMod from "../src/relatedNotes";
+import * as embeddingServiceMod from "../src/embeddingService";
 import { sanitizeNumericSettings, needsBackupRescue, pickSettingsSource, fallbackMatchesDefaults, payloadNeedsRescue, SUMMARY_MAX_TOKENS_LEGACY_DEFAULT, SUMMARY_MAX_TOKENS_DEFAULT } from "../src/settingsSanitize";
 import { AiClient, OUTPUT_TRUNCATED_HINT } from "../src/ai";
 import { PluginFileStore, SETTINGS_FILE, STATE_FILE } from "../src/pluginStorage";
@@ -37,6 +38,7 @@ export const m = {
   ...videoSummaryServiceMod,
   ...summaryServiceMod,
   ...relatedNotesMod,
+  ...embeddingServiceMod,
   SyncEngine,
   MediaStore,
   VideoMediaStore,

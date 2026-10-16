@@ -2,7 +2,7 @@ import { App, Notice, TFile, normalizePath } from "obsidian";
 import { DouyinClient, isFolderApiUnavailableError } from "./douyinClient";
 import { createAsrProvider } from "./asr";
 import { AiClient } from "./ai";
-import { resolveAiChannel, resolveVisionChannel, resolveVideoSummaryChannel, isQuotaExhaustedError } from "./aiConfig";
+import { resolveAiChannel, resolveVisionChannel, resolveVideoSummaryChannel, resolveEmbeddingChannel, isQuotaExhaustedError } from "./aiConfig";
 import { MediaStore } from "./media";
 import { VideoMediaStore, VideoAssets, isDeterministicMediaError, type MediaErrorKind } from "./videoMedia";
 import { generateBases } from "./bases";
@@ -22,6 +22,7 @@ import { isAudioOnlyItem, AUDIO_ONLY_REASON } from "./itemType";
 import { clampConcurrency, mapLimit, Semaphore } from "./concurrency";
 import { detailStageTimings, summarizeStageTimings, StageTimer } from "./perf";
 import { SyncLedger, ASR_RETRY_MAX } from "./syncLedger";
+import { EmbeddingClient, VectorStore, contentHash, type VectorHit } from "./embeddingService";
 // P2-2：确定性失败正则迁至 asr/failureKind.ts 供 provider 与引擎共用（正则文本逐字未动，仍为兜底）
 import { DETERMINISTIC_ASR_FAILURE_RE } from "./asr/failureKind";
 
@@ -148,6 +149,15 @@ export class SyncEngine {
   /** OCR 全局并发闸门：跨条目统一限流，避免条目级 × 图片级并发把请求放大 9 倍（见 visionConcurrency 说明） */
   private ocrGate: Semaphore | null = null;
   /**
+   * embedding 客户端与向量库（批次三语义检索 / 向量互链共用）：
+   * - embedClient 按 settings 重建（refreshClients，与 ai/visionAi 同口径——Key 未配置时保持 null）；
+   * - vectorStore 与 settings 无关（插件目录固定），由宿主 attachVectorStore 注入（manifest.dir
+   *   在引擎里不可得，也不该成为引擎构造签名的一部分）；未注入（旧宿主/测试）时语义功能整体静默缺席，
+   *   互链自动回落同分类/同作者打分——零破坏。
+   */
+  private embedClient: EmbeddingClient | null = null;
+  private vectorStore: VectorStore | null = null;
+  /**
    * 本次同步的转写预算（2026-09-27 第四轮）：maxTranscribePerSync 此前只约束重试队列，
    * 全新条目的转写完全不受限——首次全量同步 1000 条会一次性烧掉几百条转写费。
    * processItem 的转写分支先扣减本计数，耗尽后条目进 pendingAsr（不 bump attempts），下次同步续传。
@@ -248,6 +258,17 @@ export class SyncEngine {
       this.visionAi.setTimeoutMs(60_000);
       this.ocrGate = new Semaphore(clampConcurrency(s.visionConcurrency, 3));
     }
+    // embedding 通道（批次三）：与 ai 同口径——Key 未配置不建客户端，语义功能走「未配置」提示；
+    // vectorStore 与 settings 无关，不在本方法动（attachVectorStore 注入，manifest.dir 属宿主）。
+    const eChan = resolveEmbeddingChannel(s);
+    this.embedClient = eChan.apiKey
+      ? new EmbeddingClient(eChan.baseUrl, eChan.apiKey, s.embeddingModel)
+      : null;
+  }
+
+  /** 宿主（main）注入向量库：插件目录在引擎外才可得。重复注入以最后一次为准（幂等）。 */
+  attachVectorStore(store: VectorStore): void {
+    this.vectorStore = store;
   }
 
   /** ffmpeg 可用性检测（设置页按钮用）：返回版本首行或 null；force=true 绕过结果缓存重新探测。 */
@@ -1400,10 +1421,10 @@ export class SyncEngine {
     self: { id: string; category: string; author: string },
     candidates: RelatedCandidate[],
   ): Promise<RelatedLink[]> {
-    const links = pickRelatedLinks(
+    // 批次三：向量索引可用时按余弦 topK 选链，回落同分类/同作者打分（pickLinksForCurrent 内部封装）
+    const links = await this.pickLinksForCurrent(
       { ...self, path: file.path, title: "", likes: 0 },
       candidates,
-      Math.max(1, Math.min(30, this.settings.relatedNotesMax || 8)),
     );
     const block = buildRelatedBlock(links);
     // 无变化不写盘（第九轮 A4，与 refreshAllRelatedNotes 同口径）：内容不变时 vault.process
@@ -1436,9 +1457,8 @@ export class SyncEngine {
       for (const cand of candidates) {
         const f = this.app.vault.getAbstractFileByPath(normalizePath(cand.path));
         if (!(f instanceof TFile)) continue;
-        const block = buildRelatedBlock(
-          pickRelatedLinks(cand, candidates, Math.max(1, Math.min(30, this.settings.relatedNotesMax || 8))),
-        );
+        const links = await this.pickLinksForCurrent(cand, candidates);
+        const block = buildRelatedBlock(links);
         let cur: string;
         try {
           cur = await this.app.vault.read(f);
@@ -1453,6 +1473,167 @@ export class SyncEngine {
     } finally {
       this.running = false;
     }
+  }
+
+  // ---------- 语义检索 / 向量互链（批次三，2026-10-16） ----------
+
+  /** 向量互链相似度门槛：低于它的候选视为「不相关」，宁缺毋滥（互链价值的本意是少而准）。 */
+  private static readonly VECTOR_LINK_MIN_SCORE = 0.3;
+  /** 语义搜索最低相似度：比互链门槛松一档（搜索场景用户想看「沾边」的结果）。 */
+  private static readonly SEARCH_MIN_SCORE = 0.15;
+
+  /**
+   * 笔记的向量输入文本：frontmatter 之外的正文，压掉多余空白后取前 2000 码点。
+   * OCR 文本 / 逐字稿 / 摘要都在正文里，前 2000 码点已足够撑起语义（v4 上限 8192 token，
+   * 2000 中文字符 ≈ 2000~3000 token，留足余量且省费用）。
+   */
+  private async noteTextForEmbed(path: string): Promise<string> {
+    try {
+      const f = this.app.vault.getAbstractFileByPath(normalizePath(path));
+      if (!(f instanceof TFile)) return "";
+      const raw = await this.app.vault.read(f);
+      const body = raw.startsWith("---")
+        ? (() => {
+            const lines = raw.split(/\r?\n/);
+            for (let i = 1; i < lines.length; i++) {
+              if (/^(---|\.\.\.)\s*$/.test(lines[i])) return lines.slice(i + 1).join("\n");
+            }
+            return raw; // frontmatter 未闭合：整个文件按正文算（宁可多 embed 不丢内容）
+          })()
+        : raw;
+      return sliceByCodePoints(body.replace(/[ \t]+/g, " ").replace(/\n{2,}/g, "\n").trim(), 2000);
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * 互链接链选择器（批次三重构的核心接线）：向量索引可用时按余弦 topK 选「内容真正相似」的笔记，
+   * 不可用 / self 无向量 / 命中过门槛的不足 1 条时回落同分类/同作者打分——零破坏旧路径。
+   * self 不在索引里（新笔记刚写完）时现场 embed 一次（单次调用数百 ms，互链阶段本身是收尾低频路径；
+   * embed 失败静默回落打分，互链永不阻断同步主流程）。
+   */
+  private async pickLinksForCurrent(self: RelatedCandidate, candidates: RelatedCandidate[]): Promise<RelatedLink[]> {
+    const max = Math.max(1, Math.min(30, this.settings.relatedNotesMax || 8));
+    const vs = this.vectorStore;
+    if (vs && this.embedClient && vs.size() > 0) {
+      try {
+        await vs.ensureLoaded();
+        let selfVec = vs.get(self.id)?.v;
+        if (!selfVec) {
+          const text = await this.noteTextForEmbed(self.path);
+          if (text) {
+            const v = await this.embedClient.embedOne(text);
+            if (v && v.length > 0) selfVec = new Float32Array(v);
+          }
+        }
+        if (selfVec) {
+          // 多取 25% 候选：过滤「id 已不在候选集」（笔记刚被移动/删除，索引滞后一轮）后仍可能满额
+          const hits: VectorHit[] = vs.topKFor(selfVec, max + 5, SyncEngine.VECTOR_LINK_MIN_SCORE);
+          const byId = new Map(candidates.map((c) => [c.id, c]));
+          const links: RelatedLink[] = [];
+          for (const hit of hits) {
+            if (hit.id === self.id) continue;
+            const c = byId.get(hit.id);
+            if (!c) continue;
+            links.push({
+              path: c.path,
+              title: c.title,
+              sameCategory: !!self.category && !!c.category && self.category === c.category,
+              sameAuthor: !!self.author && !!c.author && self.author === c.author,
+            });
+            if (links.length >= max) break;
+          }
+          // 有向量就如实返回（含空）：低于门槛宁缺毋滥是向量互链的价值前提，
+          // 此时回落同分类打分会把「确实无内容相似」的笔记硬凑回互链块
+          return links;
+        }
+      } catch (e) {
+        if (typeof console !== "undefined" && (globalThis as any).__R3DEBUG) console.warn("[r3 debug] vec link path threw:", e);
+        /* 向量路径任何异常都回落打分，互链不阻断 */
+      }
+    }
+    // 向量路径整体不可用（无索引 / 无客户端 / self 向量拿不到）：回落同分类/同作者打分
+    return pickRelatedLinks(self, candidates, max);
+  }
+
+  /**
+   * 构建语义索引（命令入口）：全库候选 × contentHash 增量向量化。
+   * - 换过 embeddingModel → resetForModel 全量重算（旧维度向量对新模型无意义）；
+   * - 正文没变（hash 相同）→ 跳过，零重复计费；
+   * - 每 10 条一批串行调用（429/5xx 退避在 EmbeddingClient 内），批间推进度；
+   * - 收尾 pruneExcept 清孤儿向量（笔记已删），persist 原子落盘。
+   * 返回给用户看的一句话汇总；通道未配置返回说明文案。
+   */
+  async buildSemanticIndex(onProgress?: (text: string) => void): Promise<string> {
+    if (this.running) throw new Error("同步正在进行中");
+    this.running = true;
+    try {
+      const chan = resolveEmbeddingChannel(this.settings);
+      if (chan.problem || !this.embedClient) {
+        return `语义索引不可用：${chan.problem || "embedding 通道未配置"}`;
+      }
+      const vs = this.vectorStore;
+      if (!vs) return "语义索引不可用：向量库未注入（插件宿主异常）";
+      await vs.ensureLoaded();
+      if (!vs.isModel(this.settings.embeddingModel)) vs.resetForModel(this.settings.embeddingModel);
+      const candidates = this.collectRelatedCandidates();
+      if (candidates.length === 0) return "没有可索引的笔记（先完成一次同步）";
+      const todo: { id: string; text: string; hash: string }[] = [];
+      for (const c of candidates) {
+        const text = await this.noteTextForEmbed(c.path);
+        if (!text) continue;
+        const hash = contentHash(text);
+        if (vs.get(c.id)?.h === hash) continue; // 正文没变：不重算不重付
+        todo.push({ id: c.id, text, hash });
+      }
+      let done = 0;
+      for (let i = 0; i < todo.length; i += 10) {
+        const batch = todo.slice(i, i + 10);
+        const vecs = await this.embedClient.embed(batch.map((b) => b.text));
+        for (let j = 0; j < batch.length; j++) {
+          vs.set(batch[j].id, batch[j].hash, new Float32Array(vecs[j]));
+        }
+        done += batch.length;
+        onProgress?.(`语义索引：已向量化 ${done}/${todo.length}`);
+      }
+      const pruned = vs.pruneExcept(new Set(candidates.map((c) => c.id)));
+      await vs.persist();
+      return todo.length === 0
+        ? `语义索引已是最新（共 ${vs.size()} 篇${pruned ? `，清理孤儿 ${pruned} 条` : ""}）`
+        : `语义索引完成：新增/更新 ${todo.length}，总 ${vs.size()} 篇${pruned ? `，清理孤儿 ${pruned} 条` : ""}`;
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /**
+   * 语义搜索（命令入口）：查询文本向量化 → 余弦 topN。
+   * 返回 null = 当前不可搜（通道未配置 / 索引为空），调用方负责提示「先构建语义索引」；
+   * 返回空数组 = 索引在但没有沾边的命中。
+   */
+  async semanticSearch(
+    query: string,
+    topN = 10,
+  ): Promise<{ path: string; title: string; category: string; score: number }[] | null> {
+    const chan = resolveEmbeddingChannel(this.settings);
+    if (chan.problem || !this.embedClient) return null;
+    const vs = this.vectorStore;
+    if (!vs) return null;
+    await vs.ensureLoaded();
+    if (vs.size() === 0) return null;
+    const qv = await this.embedClient.embedOne(query);
+    if (!qv || qv.length === 0) return null;
+    const hits = vs.topKFor(new Float32Array(qv), Math.max(1, Math.min(30, topN)), SyncEngine.SEARCH_MIN_SCORE);
+    if (hits.length === 0) return [];
+    const byId = new Map(this.collectRelatedCandidates().map((c) => [c.id, c]));
+    const out: { path: string; title: string; category: string; score: number }[] = [];
+    for (const hit of hits) {
+      const c = byId.get(hit.id);
+      if (!c) continue;
+      out.push({ path: c.path, title: c.title, category: c.category, score: hit.score });
+    }
+    return out;
   }
 
   private async writeNoteFile(path: string, content: string, overwrite?: string): Promise<TFile | null> {
@@ -2137,6 +2318,14 @@ export class SyncEngine {
           done++;
           if (this.state.backfillFails) delete this.state.backfillFails[id];
         } catch (e: any) {
+          // 批次三加固（QA 观察项②，best-effort 补偿）：移动失败时 fm 已改——回滚 category，
+          // 避免「fm 说新分类、文件还在旧目录」的中间态留到下一轮。回滚失败（同一文件刚写失败，
+          // 再写大概率也失败）只留 console，失败计数照走，下轮命令可自愈。
+          try {
+            await this.app.vault.process(file, (data) => upsertFmScalar(data, "category", curCategory || "未分类"));
+          } catch {
+            console.warn(`[douyin-sync] 分类补跑回滚 category 失败（id=${id}），留下中间态待下轮修复`);
+          }
           failed++;
           bumpFail(id);
         }

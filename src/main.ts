@@ -13,6 +13,8 @@ import { generateSummaryForFile } from "./summaryService";
 import { statusVisual } from "./statusCore";
 import { pickSettingsSource, sanitizeNumericSettings } from "./settingsSanitize";
 import { PluginFileStore, SETTINGS_FILE, STATE_FILE } from "./pluginStorage";
+import { VectorStore } from "./embeddingService";
+import { SemanticSearchModal } from "./semanticSearchModal";
 // nodeRequire 已随 P2-1 迁出（spawn 实现整体移至 ProcessManager.ensureRunning）
 import { fsExists, resolveNodeExe } from "./util";
 
@@ -78,6 +80,9 @@ export default class DouyinSyncPlugin extends Plugin {
       (t) => this.setStatusBar(t),
       () => this.spawnBridge(),
     );
+    // 向量库注入（批次三语义检索/向量互链）：vectors.json 与 settings/state 同住插件目录，
+    // manifest.dir 只有宿主拿得到——引擎不关心存储目录细节，注入而非构造参数。
+    this.engine.attachVectorStore(new VectorStore(this.app.vault.adapter, this.manifest.dir || ""));
     await this.engine.loadState(this._stateRaw);
 
     // ---- 四项新功能接线（M1 进程管控 / M4 二维状态中心 / M2 OCR / M3 摘要） ----
@@ -152,6 +157,17 @@ export default class DouyinSyncPlugin extends Plugin {
       id: "backfill-all",
       name: "全量补录存量缺口（OCR+摘要）",
       callback: () => void this.backfillAll(),
+    });
+    // 语义检索（批次三 2026-10-16）：向量索引构建 + 自然语言找收藏；互链的重构复用「重建相关笔记链接」
+    this.addCommand({
+      id: "semantic-index",
+      name: "构建语义索引（embedding 向量化全库）",
+      callback: () => void this.runSemanticIndex(),
+    });
+    this.addCommand({
+      id: "semantic-search",
+      name: "语义搜索收藏",
+      callback: () => this.openSemanticSearch(),
     });
     // 强制重抽帧（keyframeIntervalSec 不追溯的逃生门）：一次性标志，下次同步生效后自动清除
     this.addCommand({
@@ -641,6 +657,30 @@ export default class DouyinSyncPlugin extends Plugin {
     } catch (e: any) {
       n.setMessage(`重建失败：${String(e?.message ?? e).slice(0, 150)}`);
     }
+  }
+
+  /**
+   * 构建语义索引（批次三命令入口）：进度走状态栏（全库首建分钟级，常驻 Notice 会叠屏），
+   * 结果走 showResult。向量库由 loadSettings 后注入（attachVectorStore）。
+   * 设置页「开始构建」按钮也走此入口，故非 private。
+   */
+  async runSemanticIndex(): Promise<void> {
+    try {
+      const r = await this.engine.buildSemanticIndex((t) => this.setStatusBar(t));
+      this.setStatusBar("");
+      this.showResult(r);
+    } catch (e: any) {
+      this.showResult(`语义索引失败：${String(e?.message ?? e).slice(0, 150)}`, true);
+    }
+  }
+
+  /** 语义搜索弹窗（批次三命令入口）：索引为空/未配置时 Modal 内给出构建指引。 */
+  private openSemanticSearch(): void {
+    new SemanticSearchModal(
+      this.app,
+      (q) => this.engine.semanticSearch(q, 10),
+      "还没有语义索引——先运行命令「构建语义索引（embedding 向量化全库）」再搜索",
+    ).open();
   }
 
   private async getPingDetail(): Promise<Record<string, unknown> | null> {

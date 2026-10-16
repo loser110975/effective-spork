@@ -47,5 +47,7 @@ export interface PluginHost extends Plugin {
   recategorizeUncategorized(): Promise<void>;
   fixFolderMismatch(): Promise<void>;
   backfillAll(): Promise<void>;
+  /** 批次三语义检索（2026-10-16）：全库向量索引构建（设置页按钮入口）。 */
+  runSemanticIndex(): Promise<void>;
   showResult(msg: string, isError?: boolean): void;
 }

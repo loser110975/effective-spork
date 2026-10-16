@@ -138,6 +138,20 @@ const VIDEO_SUMMARY_CHANNEL: ChannelSpec = {
   apiKeyChain: ["videoSummaryApiKey"],
 };
 
+/**
+ * embedding 通道（批次三语义检索/向量互链，2026-10-16）：只认 embeddingBaseUrl / embeddingApiKey。
+ * Base URL 有静态默认（百炼 compatible-mode，DEFAULT_SETTINGS.embeddingBaseUrl）；
+ * Key 留空即报「未配置」——与其他四通道同口径，不再引入跨键回退。
+ */
+const EMBEDDING_CHANNEL: ChannelSpec = {
+  id: "embedding",
+  label: "语义检索 embedding",
+  baseUrlKeys: ["embeddingBaseUrl"],
+  baseUrlDefaultKey: "embeddingBaseUrl",
+  modelKey: "embeddingModel",
+  apiKeyChain: ["embeddingApiKey"],
+};
+
 // ---------- 四个 resolver（工厂调用） ----------
 
 /** 通用 AI 通道（自动分类 / 图文摘要）。 */
@@ -155,6 +169,9 @@ const primaryPanelResolver = createChannelResolver(OCR_PRIMARY_CHANNEL);
 
 /** 视频多模态总结通道。 */
 export const resolveVideoSummaryChannel = createChannelResolver(VIDEO_SUMMARY_CHANNEL);
+
+/** embedding 通道（批次三语义检索 / 向量互链共用）。 */
+export const resolveEmbeddingChannel = createChannelResolver(EMBEDDING_CHANNEL);
 
 /**
  * 配额耗尽类错误识别（2026-10-01 第十三轮，真实样本驱动）：

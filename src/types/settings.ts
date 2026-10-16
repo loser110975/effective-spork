@@ -86,6 +86,13 @@ export interface DouyinSyncSettings {
   relatedNotesEnabled: boolean;
   /** 每篇笔记最多互链条数（1~30） */
   relatedNotesMax: number;
+  // 语义检索（批次三，2026-10-16）：embedding 通道独立三键（与其他通道同口径：只认自有键，留空报未配置）
+  /** embedding 通道 Base URL（OpenAI 兼容 /embeddings 端点；默认百炼 compatible-mode） */
+  embeddingBaseUrl: string;
+  /** embedding 通道 API Key（与 AI 通道同账号（百炼）时填同一个 Key） */
+  embeddingApiKey: string;
+  /** embedding 模型（默认百炼 text-embedding-v4；换模型会触发全库向量重算） */
+  embeddingModel: string;
   /** OCR 视觉通道独立基址（必填；2026-10-15 起不再回退 aiBaseUrl）。用于把 OCR 从过载通道隔离出来 */
   visionBaseUrl: string;
   /** OCR 视觉通道独立 Key（必填；2026-10-15 起不再回退 aiKey / dashscopeKey） */
@@ -174,6 +181,10 @@ export const DEFAULT_SETTINGS: DouyinSyncSettings = {
   visionModel: "qwen-vl-plus",
   relatedNotesEnabled: true,
   relatedNotesMax: 8,
+  // 语义检索（批次三）：默认百炼 compatible-mode + text-embedding-v4；Key 留空 = 未配置报错（不回退 aiKey，2026-10-15 通道独立化口径）
+  embeddingBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  embeddingApiKey: "",
+  embeddingModel: "text-embedding-v4",
   visionBaseUrl: "",
   visionApiKey: "",
   visionConcurrency: 3,

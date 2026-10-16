@@ -163,7 +163,10 @@ export function splitOneLiner(raw: string): { oneLiner: string; body: string } {
   const lines = text.split("\n");
   const firstIdx = lines.findIndex((l) => l.trim() !== "");
   if (firstIdx >= 0) {
-    const m = lines[firstIdx].match(/^一行式：\s*(.*)$/);
+    // 批次三加固（QA 观察项③）：trim 后再匹配——模型输出带前导空格/全角空格/缩进的
+    // `一行式：` 变体此前不命中 `^一行式：`，整行（含哨兵字样）被回退分支截 60 字写进
+    // fm summary，哨兵字样泄漏给画廊。trim() 覆盖半角/全角空格与零宽空白之外的常规缩进。
+    const m = lines[firstIdx].trim().match(/^一行式：\s*(.*)$/);
     if (m) {
       return { oneLiner: m[1].trim(), body: lines.slice(firstIdx + 1).join("\n").trim() };
     }
@@ -186,6 +189,9 @@ export function splitOneLiner(raw: string): { oneLiner: string; body: string } {
  */
 export function applySummaryToNote(markdownRaw: string, summary: string, summaryV?: number): string {
   const markdown = stripBom(markdownRaw);
+  // 批次三加固（QA 观察项①）：空白 summary 直接原样返回——此前 splitOneLiner("") 会产出
+  // oneLiner=""，把既有 fm summary 写空、既有正文摘要块写成空块。宁可不动，等下次有效输出。
+  if (!String(summary ?? "").trim()) return markdown;
   // 畸形 frontmatter（--- 无闭合）：任何写入都会让原围栏降级为正文，放弃并保持原样（宁可不动）
   if (isUnclosedFrontmatter(markdown)) return markdown;
   const { oneLiner, body } = splitOneLiner(summary);
