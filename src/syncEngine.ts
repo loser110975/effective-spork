@@ -1563,22 +1563,31 @@ export class SyncEngine {
    * - 正文没变（hash 相同）→ 跳过，零重复计费；
    * - 每 10 条一批串行调用（429/5xx 退避在 EmbeddingClient 内），批间推进度；
    * - 收尾 pruneExcept 清孤儿向量（笔记已删），persist 原子落盘。
-   * 返回给用户看的一句话汇总；通道未配置返回说明文案。
+   * opts.silent（同步收尾自动链专用）：通道未配置 / 无候选 / 无缺口时返回空串不弹提示，
+   * 有实际增量时才返回一句话——常规同步收尾零成本维护索引新鲜度，用户不用挑时机。
+   * 返回给用户看的一句话汇总；通道未配置（非 silent）返回说明文案。
    */
-  async buildSemanticIndex(onProgress?: (text: string) => void): Promise<string> {
+  async buildSemanticIndex(
+    onProgress?: (text: string) => void,
+    opts?: { silent?: boolean },
+  ): Promise<string> {
+    const silent = !!opts?.silent;
     if (this.running) throw new Error("同步正在进行中");
     this.running = true;
     try {
       const chan = resolveEmbeddingChannel(this.settings);
       if (chan.problem || !this.embedClient) {
-        return `语义索引不可用：${chan.problem || "embedding 通道未配置"}`;
+        return silent ? "" : `语义索引不可用：${chan.problem || "embedding 通道未配置"}`;
       }
       const vs = this.vectorStore;
-      if (!vs) return "语义索引不可用：向量库未注入（插件宿主异常）";
+      if (!vs) return silent ? "" : "语义索引不可用：向量库未注入（插件宿主异常）";
       await vs.ensureLoaded();
       if (!vs.isModel(this.settings.embeddingModel)) vs.resetForModel(this.settings.embeddingModel);
       const candidates = this.collectRelatedCandidates();
-      if (candidates.length === 0) return "没有可索引的笔记（先完成一次同步）";
+      if (candidates.length === 0) {
+        if (silent) return "";
+        return "没有可索引的笔记（先完成一次同步）";
+      }
       const todo: { id: string; text: string; hash: string }[] = [];
       for (const c of candidates) {
         const text = await this.noteTextForEmbed(c.path);
@@ -1599,9 +1608,11 @@ export class SyncEngine {
       }
       const pruned = vs.pruneExcept(new Set(candidates.map((c) => c.id)));
       await vs.persist();
-      return todo.length === 0
-        ? `语义索引已是最新（共 ${vs.size()} 篇${pruned ? `，清理孤儿 ${pruned} 条` : ""}）`
-        : `语义索引完成：新增/更新 ${todo.length}，总 ${vs.size()} 篇${pruned ? `，清理孤儿 ${pruned} 条` : ""}`;
+      if (todo.length === 0) {
+        // silent（同步收尾自动链）：无缺口时空串不弹「已是最新」——每次同步都弹就是噪音
+        return silent ? "" : `语义索引已是最新（共 ${vs.size()} 篇${pruned ? `，清理孤儿 ${pruned} 条` : ""}）`;
+      }
+      return `${silent ? "语义索引增量" : "语义索引"}完成：新增/更新 ${todo.length}，总 ${vs.size()} 篇${pruned ? `，清理孤儿 ${pruned} 条` : ""}`;
     } finally {
       this.running = false;
     }

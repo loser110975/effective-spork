@@ -270,7 +270,7 @@ export class DouyinSyncSettingTab extends PluginSettingTab {
       .addText((t) => t.setValue(s.embeddingModel).onChange(async (v) => { s.embeddingModel = v.trim() || "text-embedding-v4"; this.queueSave(); }));
     new Setting(containerEl)
       .setName("构建语义索引")
-      .setDesc("把全库笔记正文向量化落盘（正文没变的篇目自动跳过、零重复计费；约 1100 篇首建分钟级）。建好后可用命令「语义搜索收藏」自然语言找内容；互链重建也自动升级为向量选链")
+      .setDesc("把全库笔记正文向量化落盘（正文没变的篇目自动跳过、零重复计费；约 1100 篇首建分钟级）。首建后无需再手动维护——常规同步收尾会自动增量更新；可用命令「语义搜索收藏」自然语言找内容，互链重建也自动升级为向量选链")
       .addButton((b) => b.setButtonText("开始构建").onClick(() => void this.plugin.runSemanticIndex()));
 
     new Setting(containerEl).setName("视频多模态总结（视频类收藏专用）").setHeading();

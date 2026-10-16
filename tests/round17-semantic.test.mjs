@@ -469,6 +469,16 @@ export function runTests(m) {
         });
         msg = await engine.buildSemanticIndex();
         t("孤儿清理：候选集外的向量被清", msg.includes("清理孤儿 1 条") && vs.size() === 2);
+        // silent 模式（同步收尾自动链）：无缺口/未配置静默空串，有增量才提示
+        msg = await engine.buildSemanticIndex(undefined, { silent: true });
+        t("silent 无缺口：空串不弹「已是最新」", msg === "");
+        vault.files.set("抖音/收藏/AI 编程/n1.md", {
+          data: noteMarkdown({ ...NOTES.n1, body: NOTES.n1.body + "（新追加的增量内容。）" }),
+          size: 0,
+          mtime: 0,
+        });
+        msg = await engine.buildSemanticIndex(undefined, { silent: true });
+        t("silent 有增量：返回增量完成文案", msg.includes("语义索引增量") && msg.includes("新增/更新 1"));
       }
       // semanticSearch：命中排序 + 索引空 null
       {

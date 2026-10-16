@@ -385,6 +385,11 @@ export default class DouyinSyncPlugin extends Plugin {
       if (ocrMsg) msgs.push(ocrMsg);
       const sumMsg = await this.engine.backfillVideos((t) => this.setStatusBar(t), { zeroAsrBudget: true });
       if (sumMsg) msgs.push(sumMsg);
+      // ③ 语义索引增量（批次三体验修复）：同步期间用户点「构建语义索引」会被 running 互斥
+      // 挡下（截图实测「语义索引失败：同步正在进行中」）——用户不该操心挑时机。收尾静默增量：
+      // 无缺口/未配置时返回空串不弹（buildSemanticIndex silent 模式），有新增笔记才提示一句。
+      const idxMsg = await this.engine.buildSemanticIndex((t) => this.setStatusBar(t), { silent: true });
+      if (idxMsg) msgs.push(idxMsg);
       if (msgs.length) new Notice(msgs.join("\n"), 10000);
     } catch (e: any) {
       // 补缺口失败不吞同步结果：只提示，不重抛
@@ -670,7 +675,13 @@ export default class DouyinSyncPlugin extends Plugin {
       this.setStatusBar("");
       this.showResult(r);
     } catch (e: any) {
-      this.showResult(`语义索引失败：${String(e?.message ?? e).slice(0, 150)}`, true);
+      const msg = String(e?.message ?? e);
+      // 互斥命中是「时机不对」不是故障：给出明确出路（2026-10-16 截图实测「语义索引失败：同步正在进行中」）
+      if (/同步正在进行中/.test(msg)) {
+        this.showResult("同步正在进行中，索引暂不能构建——这轮同步/补录结束后再点一次；常规同步收尾也会自动增量更新索引", true);
+      } else {
+        this.showResult(`语义索引失败：${msg.slice(0, 150)}`, true);
+      }
     }
   }
 
